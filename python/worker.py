@@ -303,8 +303,9 @@ def _wait_and_poll_for_drop(client, target_ts: float, stop_evt: threading.Event,
 
     Returns True if a reserve_token was obtained, False otherwise.
     """
-    POLL_INTERVAL = 0.15
-    POST_DROP_GRACE = 10.0
+    POLL_INTERVAL = 0.15       # pre-drop: gentle, just to stay warm
+    POST_DROP_INTERVAL = 0.08  # post-drop: tight — tiers often appear exactly at T=0
+    POST_DROP_GRACE = 30.0     # keep trying well past the drop if tiers lag
 
     # ── 1. Interruptible sleep until T-3s ────────────────────────────────
     while True:
@@ -347,6 +348,8 @@ def _wait_and_poll_for_drop(client, target_ts: float, stop_evt: threading.Event,
     if getattr(client, "reserveToken", None):
         return True
 
+    log("No reserve_token at T-0 — polling post-drop for up to "
+        f"{int(POST_DROP_GRACE)}s (tiers may not publish until the exact drop).")
     grace_end = time.time() + POST_DROP_GRACE
     while time.time() < grace_end:
         if stop_evt.is_set():
@@ -356,8 +359,9 @@ def _wait_and_poll_for_drop(client, target_ts: float, stop_evt: threading.Event,
         except Exception as exc:
             log(f"Post-drop poll error: {exc}", "warn")
         if getattr(client, "reserveToken", None):
+            log(f"Token obtained {time.time() - target_ts:.2f}s after drop.")
             return True
-        time.sleep(POLL_INTERVAL)
+        time.sleep(POST_DROP_INTERVAL)
 
     return False
 
@@ -515,6 +519,23 @@ def _run_cart_inner(
     if stop_evt.is_set():
         return False, "stopped"
 
+    # Probe the event once so we know if it's locked, and claim the access
+    # code before any timing-critical work. Claims are per-account-per-event
+    # and persist server-side, so a single upfront claim is enough.
+    probe = client.fetch_ticket_types(authenticated=True)
+    if probe is None:
+        return False, "Failed to fetch event"
+    presale_code = (params.get("presale_code") or "").strip()
+    if client.eventIsLocked:
+        if not presale_code:
+            return False, "Event is locked — add an access code to this task"
+        log("Event is locked — claiming access code.")
+        resp = client.claim_code()
+        if not resp or resp.status_code != 200:
+            return False, "Access code claim failed"
+        # Refresh state after claim so the poller starts from a known-good place
+        client.fetch_ticket_types(authenticated=True)
+
     target_ts = _parse_scheduled_ts(params.get("scheduled_at") or "", params.get("scheduled_tz") or "")
     if target_ts is not None and target_ts - time.time() > 3.0:
         log(f"Scheduled drop at {params.get('scheduled_at')} {params.get('scheduled_tz')} "
@@ -527,8 +548,12 @@ def _run_cart_inner(
         if not got_token:
             return False, "No tickets available after drop"
     else:
-        tickets = client.fetch_ticket_types(authenticated=True)
-        if not tickets or not client.reserveToken:
+        # Immediate flow — probe already set reserveToken on success. If the
+        # event was locked we just refreshed after the claim; either way a
+        # non-empty reserveToken means we have a ticket to cart.
+        if not client.reserveToken:
+            client.fetch_ticket_types(authenticated=True)
+        if not client.reserveToken:
             return False, "No tickets available"
 
     if stop_evt.is_set():
