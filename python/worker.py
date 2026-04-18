@@ -291,21 +291,22 @@ def _parse_scheduled_ts(scheduled_at: str, scheduled_tz: str) -> float | None:
 
 
 def _wait_and_poll_for_drop(client, target_ts: float, stop_evt: threading.Event, log) -> bool:
-    """Block until target_ts, polling fetch_ticket_types during the last 3s.
+    """Block until a reserve_token appears, anchored around target_ts.
 
-    - Sleeps (interruptibly) until T-3s.
-    - From T-3s to T-0s: refreshes ticket_types every ~150ms so we always hold
-      the freshest reserve_token when the drop opens.
-    - Final stretch (<50ms remaining): busy-waits on time.monotonic() for
-      sub-millisecond accuracy before returning.
-    - After T-0: keeps polling up to 10s post-drop if no reserve_token is
-      available yet, then returns.
+    reserve_token = eligibility to cart, not a ticket hold. First POST to
+    /purchases wins, so we fire as soon as the API will accept one.
+
+    - Interruptible sleep until T-3s (don't hammer the API early).
+    - From T-3s: polls fetch_ticket_types every ~80ms and fires the moment
+      a reserve_token appears (before, at, or after T=0).
+    - After T=0: keeps polling for up to POST_DROP_GRACE seconds if tiers
+      haven't been published yet.
 
     Returns True if a reserve_token was obtained, False otherwise.
     """
-    POLL_INTERVAL = 0.15       # pre-drop: gentle, just to stay warm
-    POST_DROP_INTERVAL = 0.08  # post-drop: tight — tiers often appear exactly at T=0
-    POST_DROP_GRACE = 30.0     # keep trying well past the drop if tiers lag
+    PRE_DROP_INTERVAL = 0.08
+    POST_DROP_INTERVAL = 0.08
+    POST_DROP_GRACE = 30.0
 
     # ── 1. Interruptible sleep until T-3s ────────────────────────────────
     while True:
@@ -315,53 +316,32 @@ def _wait_and_poll_for_drop(client, target_ts: float, stop_evt: threading.Event,
         if stop_evt.wait(timeout=min(remaining - 3.0, 1.0)):
             return False
 
-    log(f"T-3s — arming poller")
+    log(f"T-3s — polling for reserve_token; will fire as soon as one appears.")
 
-    # ── 2. Poll ticket_types every ~150ms until T-0s ────────────────────
-    last_poll = 0.0
-    while True:
-        now = time.time()
-        remaining = target_ts - now
-        if remaining <= 0.05:
-            break
-        if stop_evt.is_set():
-            return False
-        if now - last_poll >= POLL_INTERVAL:
-            try:
-                client.fetch_ticket_types(authenticated=True)
-            except Exception as exc:
-                log(f"Pre-drop poll error: {exc}", "warn")
-            last_poll = now
-        # short sleep to yield — 10ms is fine, we check time every iteration
-        time.sleep(0.01)
-
-    # ── 3. Busy-wait the final ~50ms for nanosecond-ish precision ───────
-    target_mono = time.monotonic() + max(0.0, target_ts - time.time())
-    while time.monotonic() < target_mono:
-        if stop_evt.is_set():
-            return False
-
-    log("T-0 — firing")
-
-    # ── 4. If we already have a reserve_token, great. Otherwise keep
-    #       polling for up to POST_DROP_GRACE seconds until one appears. ─
-    if getattr(client, "reserveToken", None):
-        return True
-
-    log("No reserve_token at T-0 — polling post-drop for up to "
-        f"{int(POST_DROP_GRACE)}s (tiers may not publish until the exact drop).")
-    grace_end = time.time() + POST_DROP_GRACE
-    while time.time() < grace_end:
+    # ── 2. Tight poll loop. Fire early if tiers publish before T=0;
+    #       keep going through T=0 and into the post-drop grace window. ─
+    deadline = target_ts + POST_DROP_GRACE
+    interval = PRE_DROP_INTERVAL
+    announced_t0 = False
+    while time.time() < deadline:
         if stop_evt.is_set():
             return False
         try:
             client.fetch_ticket_types(authenticated=True)
         except Exception as exc:
-            log(f"Post-drop poll error: {exc}", "warn")
+            log(f"Poll error: {exc}", "warn")
         if getattr(client, "reserveToken", None):
-            log(f"Token obtained {time.time() - target_ts:.2f}s after drop.")
+            delta = time.time() - target_ts
+            if delta < 0:
+                log(f"Reserve token obtained T{delta:.2f}s (before drop) — firing.")
+            else:
+                log(f"Reserve token obtained T+{delta:.2f}s (after drop) — firing.")
             return True
-        time.sleep(POST_DROP_INTERVAL)
+        if not announced_t0 and time.time() >= target_ts:
+            log("T-0 — no reserve_token yet, continuing to poll.")
+            announced_t0 = True
+            interval = POST_DROP_INTERVAL
+        time.sleep(interval)
 
     return False
 
@@ -537,9 +517,13 @@ def _run_cart_inner(
         client.fetch_ticket_types(authenticated=True)
 
     target_ts = _parse_scheduled_ts(params.get("scheduled_at") or "", params.get("scheduled_tz") or "")
-    if target_ts is not None and target_ts - time.time() > 3.0:
+    if client.reserveToken:
+        # Probe already got an eligible reserve_token — fire now regardless
+        # of whether this task was scheduled for later.
+        log("Reserve token already held from probe — firing immediately.")
+    elif target_ts is not None and target_ts - time.time() > 3.0:
         log(f"Scheduled drop at {params.get('scheduled_at')} {params.get('scheduled_tz')} "
-            f"(T-{target_ts - time.time():.1f}s) — waiting before cart.")
+            f"(T-{target_ts - time.time():.1f}s) — will fire as soon as a reserve_token is available.")
         emit_update(status="armed", scheduled_at=params.get("scheduled_at"),
                     scheduled_tz=params.get("scheduled_tz"))
         got_token = _wait_and_poll_for_drop(client, target_ts, stop_evt, log)
