@@ -20,9 +20,11 @@ import multiprocessing
 import os
 import sys
 import threading
+import time
 import traceback
 import uuid
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 multiprocessing.freeze_support()
 
@@ -205,6 +207,8 @@ def _task_fields(params: dict) -> dict:
         "ticket_tier": (params.get("ticket_tier") or "").strip(),
         "quantity": int(params.get("quantity") or 1),
         "mode": (params.get("mode") or "auto").strip() or "auto",
+        "scheduled_at": (params.get("scheduled_at") or "").strip(),
+        "scheduled_tz": (params.get("scheduled_tz") or "").strip(),
     }
 
 
@@ -264,6 +268,100 @@ def _log_fn_for(sid: str):
     return log
 
 
+def _parse_scheduled_ts(scheduled_at: str, scheduled_tz: str) -> float | None:
+    """Parse "YYYY-MM-DDTHH:MM[:SS]" + IANA tz → unix seconds, or None."""
+    s = (scheduled_at or "").strip()
+    if not s:
+        return None
+    # datetime-local inputs give "YYYY-MM-DDTHH:MM" with no seconds.
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            naive = datetime.strptime(s, fmt)
+            break
+        except ValueError:
+            naive = None
+    if naive is None:
+        return None
+    tz = scheduled_tz.strip() or "UTC"
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = ZoneInfo("UTC")
+    return naive.replace(tzinfo=zone).timestamp()
+
+
+def _wait_and_poll_for_drop(client, target_ts: float, stop_evt: threading.Event, log) -> bool:
+    """Block until target_ts, polling fetch_ticket_types during the last 3s.
+
+    - Sleeps (interruptibly) until T-3s.
+    - From T-3s to T-0s: refreshes ticket_types every ~150ms so we always hold
+      the freshest reserve_token when the drop opens.
+    - Final stretch (<50ms remaining): busy-waits on time.monotonic() for
+      sub-millisecond accuracy before returning.
+    - After T-0: keeps polling up to 10s post-drop if no reserve_token is
+      available yet, then returns.
+
+    Returns True if a reserve_token was obtained, False otherwise.
+    """
+    POLL_INTERVAL = 0.15
+    POST_DROP_GRACE = 10.0
+
+    # ── 1. Interruptible sleep until T-3s ────────────────────────────────
+    while True:
+        remaining = target_ts - time.time()
+        if remaining <= 3.0:
+            break
+        if stop_evt.wait(timeout=min(remaining - 3.0, 1.0)):
+            return False
+
+    log(f"T-3s — arming poller")
+
+    # ── 2. Poll ticket_types every ~150ms until T-0s ────────────────────
+    last_poll = 0.0
+    while True:
+        now = time.time()
+        remaining = target_ts - now
+        if remaining <= 0.05:
+            break
+        if stop_evt.is_set():
+            return False
+        if now - last_poll >= POLL_INTERVAL:
+            try:
+                client.fetch_ticket_types(authenticated=True)
+            except Exception as exc:
+                log(f"Pre-drop poll error: {exc}", "warn")
+            last_poll = now
+        # short sleep to yield — 10ms is fine, we check time every iteration
+        time.sleep(0.01)
+
+    # ── 3. Busy-wait the final ~50ms for nanosecond-ish precision ───────
+    target_mono = time.monotonic() + max(0.0, target_ts - time.time())
+    while time.monotonic() < target_mono:
+        if stop_evt.is_set():
+            return False
+
+    log("T-0 — firing")
+
+    # ── 4. If we already have a reserve_token, great. Otherwise keep
+    #       polling for up to POST_DROP_GRACE seconds until one appears. ─
+    if getattr(client, "reserveToken", None):
+        return True
+
+    grace_end = time.time() + POST_DROP_GRACE
+    while time.time() < grace_end:
+        if stop_evt.is_set():
+            return False
+        try:
+            client.fetch_ticket_types(authenticated=True)
+        except Exception as exc:
+            log(f"Post-drop poll error: {exc}", "warn")
+        if getattr(client, "reserveToken", None):
+            return True
+        time.sleep(POLL_INTERVAL)
+
+    return False
+
+
 _COUNTRY_PREFIXES = {
     "44": "gb", "49": "de", "33": "fr", "31": "nl", "61": "au", "91": "in",
     "34": "es", "39": "it", "353": "ie", "52": "mx", "55": "br",
@@ -296,7 +394,7 @@ def _run_login_one(sid: str, params: dict, stop_evt: threading.Event, otp_holder
     result = auth_harvester.login_single_account(
         phone=local_digits,
         country_iso=account.get("country_iso") or country_iso,
-        email=account.get("email"),
+        email=(account.get("aycd_email") or account.get("email")),
         proxy=account.get("proxy"),
         session_dir=_session_dir(),
         aycd_key=account.get("aycd_key"),
@@ -341,7 +439,7 @@ def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder
             result = auth_harvester.login_single_account(
                 phone=local_digits,
                 country_iso=account.get("country_iso") or country_iso,
-                email=account.get("email"),
+                email=(account.get("aycd_email") or account.get("email")),
                 proxy=account.get("proxy"),
                 session_dir=_session_dir(),
                 aycd_key=account.get("aycd_key"),
@@ -417,9 +515,21 @@ def _run_cart_inner(
     if stop_evt.is_set():
         return False, "stopped"
 
-    tickets = client.fetch_ticket_types(authenticated=True)
-    if not tickets or not client.reserveToken:
-        return False, "No tickets available"
+    target_ts = _parse_scheduled_ts(params.get("scheduled_at") or "", params.get("scheduled_tz") or "")
+    if target_ts is not None and target_ts - time.time() > 3.0:
+        log(f"Scheduled drop at {params.get('scheduled_at')} {params.get('scheduled_tz')} "
+            f"(T-{target_ts - time.time():.1f}s) — waiting before cart.")
+        emit_update(status="armed", scheduled_at=params.get("scheduled_at"),
+                    scheduled_tz=params.get("scheduled_tz"))
+        got_token = _wait_and_poll_for_drop(client, target_ts, stop_evt, log)
+        if stop_evt.is_set():
+            return False, "stopped"
+        if not got_token:
+            return False, "No tickets available after drop"
+    else:
+        tickets = client.fetch_ticket_types(authenticated=True)
+        if not tickets or not client.reserveToken:
+            return False, "No tickets available"
 
     if stop_evt.is_set():
         return False, "stopped"
@@ -508,6 +618,8 @@ def _run_task(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dic
         "ticket_tier": task.get("ticket_tier"),
         "quantity": task.get("quantity") or 1,
         "mode": task.get("mode") or "auto",
+        "scheduled_at": task.get("scheduled_at") or "",
+        "scheduled_tz": task.get("scheduled_tz") or "",
     }
 
     ok, err = False, ""

@@ -330,9 +330,9 @@ function showSampleModal() {
     title: "Sample CSV format",
     bodyHtml: `
       <p class="muted">Expected columns (header row):</p>
-      <pre style="background:var(--bg-0);padding:12px;border-radius:8px;font-size:11px;overflow:auto;">phone,email,card_number,exp_month,exp_year,cvc,billing_name,billing_email,billing_phone,billing_postal,billing_country,proxy,aycd_key,imap_email,imap_password,imap_host</pre>
+      <pre style="background:var(--bg-0);padding:12px;border-radius:8px;font-size:11px;overflow:auto;">phone,email,card_number,exp_month,exp_year,cvc,billing_name,billing_email,billing_phone,billing_postal,billing_country,proxy,aycd_key,aycd_email,imap_email,imap_password,imap_host</pre>
       <p class="muted" style="margin-top:10px;">All fields except <code>phone</code> are optional. XLSX with the same header is also supported.</p>
-      <p class="muted" style="margin-top:8px;">Per-account IMAP is used to read the Dice.fm OTP email. Leave <code>imap_host</code> blank to default to <code>imap.gmail.com</code>. Gmail needs an app password, not your regular login.</p>
+      <p class="muted" style="margin-top:8px;">Per-account IMAP reads the OTP email; leave <code>imap_host</code> blank for <code>imap.gmail.com</code> (Gmail needs an app password). <code>aycd_email</code> overrides the AYCD lookup address — leave blank to reuse the <code>email</code> field.</p>
     `,
     footerHtml: `<button class="btn btn-ghost" data-close>Close</button>
                  <button class="btn btn-primary" id="dlSampleBtn">Download CSV</button>`,
@@ -356,6 +356,7 @@ function openAccountModal(account) {
         <label><span>Email</span><input id="f_email" value="${escapeHtml(a.email || "")}" /></label>
         <label><span>Proxy</span><input id="f_proxy" value="${escapeHtml(a.proxy || "")}" placeholder="user:pass@host:port" /></label>
         <label><span>AYCD key (per-account)</span><input id="f_aycd" value="${escapeHtml(a.aycd_key || "")}" /></label>
+        <label><span>AYCD email (optional — defaults to account email)</span><input id="f_aycd_email" value="${escapeHtml(a.aycd_email || "")}" placeholder="${escapeHtml(a.email || "")}" /></label>
         <label><span>IMAP email</span><input id="f_imap_email" value="${escapeHtml(a.imap_email || "")}" placeholder="otp-inbox@example.com" /></label>
         <label><span>IMAP password</span><input id="f_imap_pw" type="password" value="${escapeHtml(a.imap_password || "")}" placeholder="app password" /></label>
         <label><span>IMAP host</span><input id="f_imap_host" value="${escapeHtml(a.imap_host || "")}" placeholder="imap.gmail.com" /></label>
@@ -383,6 +384,7 @@ function openAccountModal(account) {
           email: $("#f_email").value.trim(),
           proxy: $("#f_proxy").value.trim(),
           aycd_key: $("#f_aycd").value.trim(),
+          aycd_email: $("#f_aycd_email").value.trim(),
           imap_email: $("#f_imap_email").value.trim(),
           imap_password: $("#f_imap_pw").value,
           imap_host: $("#f_imap_host").value.trim(),
@@ -541,6 +543,20 @@ function renderCartCard(cart) {
     if (!r.ok) card.textContent = "approve failed: " + r.error;
   });
   return el;
+}
+
+function browserTz() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; }
+  catch { return "UTC"; }
+}
+
+function tzSelectOptions(selected) {
+  const zones = (Intl.supportedValuesOf && Intl.supportedValuesOf("timeZone")) || [
+    "UTC","America/New_York","America/Los_Angeles","America/Chicago","America/Denver",
+    "Europe/London","Europe/Paris","Europe/Berlin","Europe/Madrid","Asia/Tokyo","Asia/Singapore","Australia/Sydney",
+  ];
+  const sel = selected || browserTz();
+  return zones.map((z) => `<option value="${escapeHtml(z)}" ${z === sel ? "selected" : ""}>${escapeHtml(z)}</option>`).join("");
 }
 
 function priceSymbol(ccy) {
@@ -714,6 +730,7 @@ function renderTaskCard(t) {
     <div class="task-meta">
       <div>Tier: ${escapeHtml(t.ticket_tier || "any")} · Qty: ${escapeHtml(String(t.quantity || 1))} · ${escapeHtml(t.mode || "auto")}</div>
       <div>Price: ${escapeHtml(priceRange)}${t.presale_code ? ` · Presale: ${escapeHtml(t.presale_code)}` : ""}</div>
+      ${t.scheduled_at ? `<div>Drop: ${escapeHtml(t.scheduled_at.replace("T"," "))} ${escapeHtml(t.scheduled_tz || "")}</div>` : ""}
       ${t.last_error ? `<div style="color:#fff; margin-top:4px;">Last error: ${escapeHtml(t.last_error)}</div>` : ""}
       ${!sessionOk ? `<div style="color:var(--text-muted); margin-top:4px;">No valid session — run auth before starting</div>` : ""}
     </div>
@@ -829,6 +846,15 @@ async function openTaskModal(task) {
             </select>
           </label>
         </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+          <label><span>Scheduled drop (leave blank to run immediately)</span>
+            <input id="t_sched" type="datetime-local" step="1" value="${escapeHtml(t.scheduled_at || "")}" />
+          </label>
+          <label><span>Timezone</span>
+            <select id="t_tz">${tzSelectOptions(t.scheduled_tz || "")}</select>
+          </label>
+        </div>
+        <p class="muted" style="font-size:11px; margin:-6px 0 0;">At T-3s the task starts polling tiers; the cart fires at the exact scheduled instant.</p>
       </div>
     `,
     footerHtml: `<button class="btn btn-ghost" data-close>Cancel</button>
@@ -843,6 +869,8 @@ async function openTaskModal(task) {
           max_price: $("#t_max").value,
           quantity: parseInt($("#t_qty").value, 10) || 1,
           mode: $("#t_mode").value,
+          scheduled_at: $("#t_sched").value.trim(),
+          scheduled_tz: $("#t_sched").value.trim() ? $("#t_tz").value : "",
         };
         let r;
         if (isEdit) {
@@ -884,6 +912,11 @@ function openBulkEditTasksModal() {
             </select>
           </label>
         </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+          <label><span>Scheduled drop</span><input id="bt_sched" type="datetime-local" step="1" /></label>
+          <label><span>Timezone</span><select id="bt_tz"><option value="">(keep)</option>${tzSelectOptions("")}</select></label>
+        </div>
+        <p class="muted" style="font-size:11px; margin:-6px 0 0;">Clear-schedule: type the literal word <code>clear</code> into "Scheduled drop" to remove it on every selected task.</p>
       </div>
     `,
     footerHtml: `<button class="btn btn-ghost" data-close>Cancel</button>
@@ -898,7 +931,18 @@ function openBulkEditTasksModal() {
         const max = $("#bt_max").value; if (max !== "") patches.max_price = max;
         const qty = $("#bt_qty").value; if (qty !== "") patches.quantity = parseInt(qty, 10) || 1;
         const mode = $("#bt_mode").value; if (mode) patches.mode = mode;
-        if (!Object.keys(patches).length) { closeModal(); return; }
+        const schedRaw = $("#bt_sched").value.trim();
+        const tzRaw = $("#bt_tz").value;
+        let clearSched = false;
+        if (schedRaw.toLowerCase() === "clear") {
+          clearSched = true;
+        } else if (schedRaw) {
+          patches.scheduled_at = schedRaw;
+          patches.scheduled_tz = tzRaw || browserTz();
+        } else if (tzRaw) {
+          patches.scheduled_tz = tzRaw;
+        }
+        if (!clearSched && !Object.keys(patches).length) { closeModal(); return; }
 
         // Merge each existing task with patches, then update.
         const byId = new Map(state.tasks.map((t) => [t.id, t]));
@@ -913,6 +957,8 @@ function openBulkEditTasksModal() {
             max_price: patches.max_price ?? cur.max_price ?? "",
             quantity: patches.quantity ?? cur.quantity ?? 1,
             mode: patches.mode ?? cur.mode ?? "auto",
+            scheduled_at: clearSched ? "" : (patches.scheduled_at ?? cur.scheduled_at ?? ""),
+            scheduled_tz: clearSched ? "" : (patches.scheduled_tz ?? cur.scheduled_tz ?? ""),
           };
           return api.updateTask(id, merged);
         }));
