@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg-info/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# PyInstaller / build outputs
+build/
+dist/
+*.spec
+
+# Local data
+*.db
+*.db-*
+.dicebot-ticketkings/
+sessions/
+*.session
+results_*.csv
+accounts.csv
+accounts_*.csv
+proxies.txt
+bright_debug.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Flet (legacy)
+.flet/
+
+# Node / Electron
+node_modules/
+build-resources/
+

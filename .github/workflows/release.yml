@@ -1,0 +1,181 @@
+name: Release DiceBot Builds
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform.name }}
+    runs-on: ${{ matrix.platform.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: macOS
+            runs_on: macos-latest
+            artifact_name: release-macos
+            artifact_paths: |
+              dist/DiceBot-*-mac.dmg
+              dist/DiceBot-*-mac.zip
+          - name: Windows
+            runs_on: windows-latest
+            artifact_name: release-windows
+            artifact_paths: |
+              dist/DiceBot-*-win.exe
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Install Python build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r python/requirements-build.txt
+
+      - name: Build electron app (${{ matrix.platform.name }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            npm run dist:mac
+          else
+            npm run dist:win
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform.artifact_name }}
+          path: ${{ matrix.platform.artifact_paths }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-github:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          mapfile -d '' files < <(find release-artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) -print0 | sort -z)
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No release files found."
+            exit 1
+          fi
+
+          if gh release view "${tag}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${files[@]}" --repo "${GH_REPO}" --clobber
+          else
+            gh release create "${tag}" "${files[@]}" --repo "${GH_REPO}" --title "${tag}" --generate-notes
+          fi
+
+  publish-r2:
+    name: Publish to Cloudflare R2
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Validate R2 config
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        shell: bash
+        run: |
+          for name in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+            if [ -z "${!name}" ]; then
+              echo "Missing: ${name}"
+              exit 1
+            fi
+          done
+
+      - name: Install AWS CLI
+        run: |
+          python3 -m pip install --user awscli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        shell: bash
+        run: |
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          tag="${GITHUB_REF_NAME}"
+
+          mapfile -d '' files < <(find release-artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) -print0 | sort -z)
+          for file in "${files[@]}"; do
+            filename="$(basename "${file}")"
+            echo "Uploading ${filename} to cli-releases/${tag}/"
+            aws --endpoint-url "${endpoint}" s3 cp "${file}" "s3://${R2_BUCKET}/cli-releases/${tag}/${filename}"
+          done
+
+          dmg="$(find release-artifacts -name '*.dmg' | head -n1)"
+          maczip="$(find release-artifacts -name '*-mac.zip' | head -n1)"
+          winexe="$(find release-artifacts -name '*-win.exe' | head -n1)"
+
+          [ -n "${dmg}" ] && aws --endpoint-url "${endpoint}" s3 cp "${dmg}" "s3://${R2_BUCKET}/latest/DiceBot-mac.dmg"
+          [ -n "${maczip}" ] && aws --endpoint-url "${endpoint}" s3 cp "${maczip}" "s3://${R2_BUCKET}/latest/DiceBot-mac.zip"
+          [ -n "${winexe}" ] && aws --endpoint-url "${endpoint}" s3 cp "${winexe}" "s3://${R2_BUCKET}/latest/DiceBot-win.exe"
+
+      - name: Write download summary
+        env:
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+        shell: bash
+        run: |
+          base="${R2_PUBLIC_BASE_URL%/}"
+          {
+            echo "## Public Downloads"
+            echo
+            echo "- ${base}/latest/DiceBot-mac.dmg"
+            echo "- ${base}/latest/DiceBot-mac.zip"
+            echo "- ${base}/latest/DiceBot-win.exe"
+            echo
+            echo "Versioned: ${base}/cli-releases/${GITHUB_REF_NAME}/"
+          } >> "$GITHUB_STEP_SUMMARY"

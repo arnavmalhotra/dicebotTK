@@ -1,0 +1,57 @@
+{
+  "name": "dicebotcli",
+  "version": "0.2.6",
+  "description": "DiceBot CLI — Dice.fm ticket automation with auth farm + cart dashboard",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "build:worker": "node ./scripts/build-worker.cjs",
+    "pack:dir": "node ./scripts/dist.cjs dir",
+    "dist:mac": "node ./scripts/dist.cjs mac",
+    "dist:win": "node ./scripts/dist.cjs win"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^37.2.0",
+    "electron-builder": "^26.8.1"
+  },
+  "dependencies": {},
+  "build": {
+    "appId": "com.dicebotcli.desktop",
+    "productName": "DiceBot",
+    "asar": true,
+    "directories": {
+      "buildResources": "build-resources",
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/worker",
+        "to": "bin",
+        "filter": ["**/*"]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": ["dmg", "zip"],
+      "artifactName": "DiceBotTicketKings-${version}-mac.${ext}"
+    },
+    "dmg": {
+      "sign": false
+    },
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "DiceBotTicketKings-${version}-win.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

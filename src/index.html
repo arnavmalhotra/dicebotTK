@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>DiceBot</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topnav">
+      <div class="brand">
+        <div class="logo">◆</div>
+        <div class="brand-text">
+          <div class="brand-name">DiceBot</div>
+          <div class="brand-sub">Dice.fm automation</div>
+        </div>
+      </div>
+      <nav class="nav-tabs" id="navTabs">
+        <button class="nav-btn active" data-page="dashboard">Dashboard</button>
+        <button class="nav-btn" data-page="accounts">Accounts</button>
+        <button class="nav-btn" data-page="auth">Auth Farm</button>
+        <button class="nav-btn" data-page="tasks">Tasks</button>
+        <button class="nav-btn" data-page="guide">Guide</button>
+        <button class="nav-btn" data-page="settings">Settings</button>
+      </nav>
+      <div class="nav-right"></div>
+    </header>
+
+    <main class="pages">
+      <!-- ── Dashboard ─────────────────────────────────────────────── -->
+      <section class="page active" id="page-dashboard">
+        <div class="page-header">
+          <div>
+            <h2>Dashboard</h2>
+            <p class="muted">Session health and running carts</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-ghost" id="gotoGuideBtn">How it works</button>
+            <button class="btn btn-primary" id="newCartBtn">One-off cart run</button>
+          </div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-card"><div class="stat-label">Total accounts</div><div class="stat-value" id="statTotal">—</div></div>
+          <div class="stat-card"><div class="stat-label">Valid sessions</div><div class="stat-value cyan" id="statValid">—</div></div>
+          <div class="stat-card"><div class="stat-label">Expiring soon</div><div class="stat-value warn" id="statExpiring">—</div></div>
+          <div class="stat-card"><div class="stat-label">Needs auth</div><div class="stat-value danger" id="statNeedsAuth">—</div></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Active carts</div>
+          <div id="cartGrid" class="cart-grid">
+            <div class="empty-state">No carts running. Start tasks from the Tasks page or kick off a one-off run.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Accounts ──────────────────────────────────────────────── -->
+      <section class="page" id="page-accounts">
+        <div class="page-header">
+          <div>
+            <h2>Accounts</h2>
+            <p class="muted">Manage Dice.fm accounts, groups, and session tokens</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-ghost" id="showSampleBtn">Show sample</button>
+            <button class="btn btn-ghost" id="importBtn">Import CSV/XLSX</button>
+            <button class="btn btn-primary" id="addAccountBtn">Add account</button>
+          </div>
+        </div>
+
+        <div class="accounts-toolbar">
+          <div class="group-chips" id="groupChips"></div>
+          <div class="toolbar-right">
+            <input type="text" id="accountSearch" placeholder="Search phone, email…" />
+          </div>
+        </div>
+
+        <div class="bulk-bar" id="bulkBar" hidden>
+          <span id="bulkCount"></span>
+          <div class="bulk-actions">
+            <button class="btn btn-ghost btn-sm" id="bulkAssignBtn">Assign to group…</button>
+            <button class="btn btn-ghost btn-sm" id="bulkAuthBtn">Run auth</button>
+            <button class="btn btn-ghost btn-sm" id="bulkMakeTasksBtn">Create tasks</button>
+            <button class="btn btn-danger btn-sm" id="bulkDeleteBtn">Delete</button>
+            <button class="btn-icon" id="bulkClearBtn" title="Clear selection">✕</button>
+          </div>
+        </div>
+
+        <div class="panel accounts-panel">
+          <table class="accounts-table">
+            <thead>
+              <tr>
+                <th class="col-sel"><input type="checkbox" id="selectAll" /></th>
+                <th>Phone</th>
+                <th>Email</th>
+                <th>Group</th>
+                <th>Proxy</th>
+                <th>Session</th>
+                <th>Expires</th>
+                <th class="col-actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="accountsBody"></tbody>
+          </table>
+          <div id="accountsEmpty" class="empty-state">No accounts yet. Click "Add account" or "Import CSV/XLSX".</div>
+        </div>
+      </section>
+
+      <!-- ── Auth Farm ─────────────────────────────────────────────── -->
+      <section class="page" id="page-auth">
+        <div class="page-header">
+          <div>
+            <h2>Auth Farm</h2>
+            <p class="muted">Harvest bearer tokens from Chrome logins — keep running 24x7 so sessions stay fresh</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-ghost" id="refreshAuthBtn">Refresh</button>
+            <button class="btn btn-primary" id="startFarmBtn">Start farm</button>
+            <button class="btn btn-danger" id="stopFarmBtn" hidden>Stop</button>
+          </div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-card"><div class="stat-label">Total</div><div class="stat-value" id="farmTotal">—</div></div>
+          <div class="stat-card"><div class="stat-label">Active sessions</div><div class="stat-value cyan" id="farmActive">—</div></div>
+          <div class="stat-card"><div class="stat-label">Expiring</div><div class="stat-value warn" id="farmExpiring">—</div></div>
+          <div class="stat-card"><div class="stat-label">Needs auth</div><div class="stat-value danger" id="farmNeeds">—</div></div>
+        </div>
+
+        <div class="two-col">
+          <div class="panel">
+            <div class="panel-title">Queue</div>
+            <div class="queue-list" id="farmQueue">
+              <div class="empty-state">No accounts pending auth.</div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-title">Log</div>
+            <div class="log-pane" id="farmLog"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Tasks ─────────────────────────────────────────────────── -->
+      <section class="page" id="page-tasks">
+        <div class="page-header">
+          <div>
+            <h2>Tasks</h2>
+            <p class="muted">Per-account purchase tasks. Only accounts with a valid session can run.</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-ghost" id="refreshTasksBtn">Refresh</button>
+            <button class="btn btn-primary" id="addTaskBtn">Add task</button>
+          </div>
+        </div>
+
+        <div class="accounts-toolbar">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text-muted);">
+              <input type="checkbox" id="selectAllTasks" /> Select all
+            </label>
+          </div>
+          <div class="toolbar-right">
+            <input type="text" id="taskSearch" placeholder="Search event, phone…" />
+          </div>
+        </div>
+
+        <div class="bulk-bar" id="taskBulkBar" hidden>
+          <span id="taskBulkCount"></span>
+          <div class="bulk-actions">
+            <button class="btn btn-primary btn-sm" id="bulkStartTasksBtn">Start</button>
+            <button class="btn btn-danger btn-sm" id="bulkStopTasksBtn">Stop</button>
+            <button class="btn btn-ghost btn-sm" id="bulkEditTasksBtn">Edit…</button>
+            <button class="btn btn-danger btn-sm" id="bulkDeleteTasksBtn">Delete</button>
+            <button class="btn-icon" id="taskBulkClearBtn" title="Clear selection">✕</button>
+          </div>
+        </div>
+
+        <div id="taskGrid" class="task-grid">
+          <div class="empty-state">No tasks yet. Click "Add task" to create one.</div>
+        </div>
+      </section>
+
+      <!-- ── Guide ─────────────────────────────────────────────────── -->
+      <section class="page" id="page-guide">
+        <div class="page-header">
+          <div>
+            <h2>Guide</h2>
+            <p class="muted">How to use DiceBot end-to-end</p>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Flow</div>
+          <div class="guide-steps">
+            <div class="guide-step">
+              <div class="guide-num">1</div>
+              <h3>Import accounts from CSV</h3>
+              <p>Go to <strong>Accounts → Import CSV/XLSX</strong>. Each row is one account with the Dice.fm phone number, email, payment details, proxy, and optional AYCD key.</p>
+              <p style="margin-top:8px;">Expected header row:</p>
+              <pre class="guide-code">phone,email,card_number,exp_month,exp_year,cvc,billing_name,billing_email,billing_phone,billing_postal,billing_country,proxy,aycd_key</pre>
+              <p style="margin-top:8px;">Only <code>phone</code> is required. Download the sample from the Accounts page if you want a starting template.</p>
+            </div>
+
+            <div class="guide-step">
+              <div class="guide-num">2</div>
+              <h3>Keep the Auth Farm running 24×7</h3>
+              <p>Open the <strong>Auth Farm</strong> page and hit <strong>Start farm</strong>. Leave it running continuously — sessions are valid for ~6 days and the farm re-authenticates accounts as they age out.</p>
+              <ul>
+                <li><strong>Active sessions</strong> are ready to buy.</li>
+                <li><strong>Expiring</strong> get rotated automatically.</li>
+                <li><strong>Needs auth</strong> go to the front of the queue.</li>
+              </ul>
+              <p style="margin-top:8px;">Only accounts with a <em>valid session</em> can run tasks — the farm is what keeps that pool full.</p>
+            </div>
+
+            <div class="guide-step">
+              <div class="guide-num">3</div>
+              <h3>Run tasks</h3>
+              <p>Go to the <strong>Tasks</strong> page. Add one task per account you want to run for a given event, then set the event link, price range, presale code, tier, quantity, and mode.</p>
+              <ul>
+                <li><strong>Start</strong> an individual task or select multiple and <strong>Start</strong> / <strong>Stop</strong> / <strong>Edit</strong> in bulk.</li>
+                <li><strong>Manual</strong> mode reserves the ticket and waits for your approval. <strong>Auto</strong> purchases immediately.</li>
+                <li>Tasks for accounts without a valid session will refuse to start — auth them first.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Settings ──────────────────────────────────────────────── -->
+      <section class="page" id="page-settings">
+        <div class="page-header">
+          <div>
+            <h2>Settings</h2>
+            <p class="muted">Captcha providers, AYCD, and defaults</p>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Captcha providers</div>
+          <div class="form-grid">
+            <label>
+              <span>CapSolver API key</span>
+              <input type="text" id="capsolverKey" placeholder="CAP-…" />
+            </label>
+            <label>
+              <span>2Captcha API key</span>
+              <input type="text" id="twocaptchaKey" placeholder="…" />
+            </label>
+            <label>
+              <span>captcha.fun API key</span>
+              <input type="text" id="captchafunKey" placeholder="…" />
+            </label>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">AYCD Inbox (default)</div>
+          <div class="form-grid">
+            <label>
+              <span>API key (fallback, per-account key on the account overrides this)</span>
+              <input type="text" id="aycdKey" placeholder="aycd_…" />
+            </label>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Defaults</div>
+          <div class="form-grid">
+            <label>
+              <span>Min price</span>
+              <input type="number" step="0.01" id="defaultMinPrice" />
+            </label>
+            <label>
+              <span>Max price</span>
+              <input type="number" step="0.01" id="defaultMaxPrice" />
+            </label>
+            <label>
+              <span>Preferred tier name (fuzzy)</span>
+              <input type="text" id="defaultTier" placeholder="GA, Tier 2, VIP…" />
+            </label>
+            <div class="form-buttons">
+              <button class="btn btn-primary" id="saveSettingsBtn">Save settings</button>
+            </div>
+            <div id="settingsStatus" class="status-line muted">—</div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ── Modals ────────────────────────────────────────────────── -->
+    <div class="modal-backdrop" id="modalBackdrop" hidden>
+      <div class="modal" id="modalBox">
+        <div class="modal-header">
+          <div class="modal-title" id="modalTitle">Modal</div>
+          <button class="modal-close" id="modalClose">✕</button>
+        </div>
+        <div class="modal-body" id="modalBody"></div>
+        <div class="modal-footer" id="modalFooter"></div>
+      </div>
+    </div>
+
+    <script src="renderer.js"></script>
+  </body>
+</html>
