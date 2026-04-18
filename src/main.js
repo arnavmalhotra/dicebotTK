@@ -121,7 +121,7 @@ function createWindow() {
     height: 820,
     minWidth: 1100,
     minHeight: 700,
-    title: "DiceBot",
+    title: "DiceBotTK",
     backgroundColor: "#000000",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
