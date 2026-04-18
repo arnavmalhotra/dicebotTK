@@ -1,4 +1,4 @@
-name: Release DiceBot Builds
+name: Release DiceBotTicketKings Builds
 
 on:
   push:
@@ -21,13 +21,13 @@ jobs:
             runs_on: macos-latest
             artifact_name: release-macos
             artifact_paths: |
-              dist/DiceBot-*-mac.dmg
-              dist/DiceBot-*-mac.zip
+              dist/DiceBotTicketKings-*-mac.dmg
+              dist/DiceBotTicketKings-*-mac.zip
           - name: Windows
             runs_on: windows-latest
             artifact_name: release-windows
             artifact_paths: |
-              dist/DiceBot-*-win.exe
+              dist/DiceBotTicketKings-*-win.exe
 
     steps:
       - name: Check out repository
@@ -152,17 +152,17 @@ jobs:
           mapfile -d '' files < <(find release-artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) -print0 | sort -z)
           for file in "${files[@]}"; do
             filename="$(basename "${file}")"
-            echo "Uploading ${filename} to cli-releases/${tag}/"
-            aws --endpoint-url "${endpoint}" s3 cp "${file}" "s3://${R2_BUCKET}/cli-releases/${tag}/${filename}"
+            echo "Uploading ${filename} to ticketkings-releases/${tag}/"
+            aws --endpoint-url "${endpoint}" s3 cp "${file}" "s3://${R2_BUCKET}/ticketkings-releases/${tag}/${filename}"
           done
 
           dmg="$(find release-artifacts -name '*.dmg' | head -n1)"
           maczip="$(find release-artifacts -name '*-mac.zip' | head -n1)"
           winexe="$(find release-artifacts -name '*-win.exe' | head -n1)"
 
-          [ -n "${dmg}" ] && aws --endpoint-url "${endpoint}" s3 cp "${dmg}" "s3://${R2_BUCKET}/latest/DiceBot-mac.dmg"
-          [ -n "${maczip}" ] && aws --endpoint-url "${endpoint}" s3 cp "${maczip}" "s3://${R2_BUCKET}/latest/DiceBot-mac.zip"
-          [ -n "${winexe}" ] && aws --endpoint-url "${endpoint}" s3 cp "${winexe}" "s3://${R2_BUCKET}/latest/DiceBot-win.exe"
+          [ -n "${dmg}" ] && aws --endpoint-url "${endpoint}" s3 cp "${dmg}" "s3://${R2_BUCKET}/latest/DiceBotTicketKings-mac.dmg"
+          [ -n "${maczip}" ] && aws --endpoint-url "${endpoint}" s3 cp "${maczip}" "s3://${R2_BUCKET}/latest/DiceBotTicketKings-mac.zip"
+          [ -n "${winexe}" ] && aws --endpoint-url "${endpoint}" s3 cp "${winexe}" "s3://${R2_BUCKET}/latest/DiceBotTicketKings-win.exe"
 
       - name: Write download summary
         env:
@@ -173,9 +173,9 @@ jobs:
           {
             echo "## Public Downloads"
             echo
-            echo "- ${base}/latest/DiceBot-mac.dmg"
-            echo "- ${base}/latest/DiceBot-mac.zip"
-            echo "- ${base}/latest/DiceBot-win.exe"
+            echo "- ${base}/latest/DiceBotTicketKings-mac.dmg"
+            echo "- ${base}/latest/DiceBotTicketKings-mac.zip"
+            echo "- ${base}/latest/DiceBotTicketKings-win.exe"
             echo
-            echo "Versioned: ${base}/cli-releases/${GITHUB_REF_NAME}/"
+            echo "Versioned: ${base}/ticketkings-releases/${GITHUB_REF_NAME}/"
           } >> "$GITHUB_STEP_SUMMARY"
