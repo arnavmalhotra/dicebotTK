@@ -1,7 +1,7 @@
 {
-  "name": "dicebotcli",
+  "name": "dicebottk",
   "version": "0.1.0",
-  "description": "DiceBot CLI — Dice.fm ticket automation with auth farm + cart dashboard",
+  "description": "DiceBotTK — Dice.fm ticket automation with auth farm, tasks, and cart dashboard",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
@@ -19,8 +19,8 @@
   },
   "dependencies": {},
   "build": {
-    "appId": "com.dicebotcli.desktop",
-    "productName": "DiceBot",
+    "appId": "com.dicebottk.desktop",
+    "productName": "DiceBotTK",
     "asar": true,
     "directories": {
       "buildResources": "build-resources",
