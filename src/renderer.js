@@ -330,8 +330,9 @@ function showSampleModal() {
     title: "Sample CSV format",
     bodyHtml: `
       <p class="muted">Expected columns (header row):</p>
-      <pre style="background:var(--bg-0);padding:12px;border-radius:8px;font-size:11px;overflow:auto;">phone,email,card_number,exp_month,exp_year,cvc,billing_name,billing_email,billing_phone,billing_postal,billing_country,proxy,aycd_key</pre>
+      <pre style="background:var(--bg-0);padding:12px;border-radius:8px;font-size:11px;overflow:auto;">phone,email,card_number,exp_month,exp_year,cvc,billing_name,billing_email,billing_phone,billing_postal,billing_country,proxy,aycd_key,imap_email,imap_password,imap_host</pre>
       <p class="muted" style="margin-top:10px;">All fields except <code>phone</code> are optional. XLSX with the same header is also supported.</p>
+      <p class="muted" style="margin-top:8px;">Per-account IMAP is used to read the Dice.fm OTP email. Leave <code>imap_host</code> blank to default to <code>imap.gmail.com</code>. Gmail needs an app password, not your regular login.</p>
     `,
     footerHtml: `<button class="btn btn-ghost" data-close>Close</button>
                  <button class="btn btn-primary" id="dlSampleBtn">Download CSV</button>`,
@@ -355,6 +356,9 @@ function openAccountModal(account) {
         <label><span>Email</span><input id="f_email" value="${escapeHtml(a.email || "")}" /></label>
         <label><span>Proxy</span><input id="f_proxy" value="${escapeHtml(a.proxy || "")}" placeholder="user:pass@host:port" /></label>
         <label><span>AYCD key (per-account)</span><input id="f_aycd" value="${escapeHtml(a.aycd_key || "")}" /></label>
+        <label><span>IMAP email</span><input id="f_imap_email" value="${escapeHtml(a.imap_email || "")}" placeholder="otp-inbox@example.com" /></label>
+        <label><span>IMAP password</span><input id="f_imap_pw" type="password" value="${escapeHtml(a.imap_password || "")}" placeholder="app password" /></label>
+        <label><span>IMAP host</span><input id="f_imap_host" value="${escapeHtml(a.imap_host || "")}" placeholder="imap.gmail.com" /></label>
         <label><span>Card number</span><input id="f_card" value="${escapeHtml(a.card_number || "")}" /></label>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
           <label><span>MM</span><input id="f_em" value="${escapeHtml(a.card_exp_month || "")}" /></label>
@@ -379,6 +383,9 @@ function openAccountModal(account) {
           email: $("#f_email").value.trim(),
           proxy: $("#f_proxy").value.trim(),
           aycd_key: $("#f_aycd").value.trim(),
+          imap_email: $("#f_imap_email").value.trim(),
+          imap_password: $("#f_imap_pw").value,
+          imap_host: $("#f_imap_host").value.trim(),
           card_number: $("#f_card").value.trim(),
           exp_month: $("#f_em").value.trim(),
           exp_year: $("#f_ey").value.trim(),

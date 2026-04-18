@@ -213,9 +213,9 @@ function registerIpc() {
     });
     if (canceled || !filePath) return { ok: false };
     const header =
-      "phone,email,card_number,exp_month,exp_year,cvc,billing_name,billing_email,billing_phone,billing_postal,billing_country,proxy,aycd_key\n";
+      "phone,email,card_number,exp_month,exp_year,cvc,billing_name,billing_email,billing_phone,billing_postal,billing_country,proxy,aycd_key,imap_email,imap_password,imap_host\n";
     const sample =
-      "+14155550100,sample@example.com,4242424242424242,12,2030,123,Sample User,sample@example.com,+14155550100,94103,US,user:pass@proxy.example:8000,\n";
+      "+14155550100,sample@example.com,4242424242424242,12,2030,123,Sample User,sample@example.com,+14155550100,94103,US,user:pass@proxy.example:8000,,sample@example.com,app-password-here,imap.gmail.com\n";
     fs.writeFileSync(filePath, header + sample);
     return { ok: true, filePath };
   });

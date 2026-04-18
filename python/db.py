@@ -57,6 +57,9 @@ def init_db() -> None:
                 billing_country TEXT DEFAULT 'US',
                 proxy TEXT DEFAULT '',
                 aycd_key TEXT DEFAULT '',
+                imap_email TEXT DEFAULT '',
+                imap_password TEXT DEFAULT '',
+                imap_host TEXT DEFAULT '',
                 group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
                 created_at TEXT DEFAULT (datetime('now'))
             );
@@ -88,6 +91,12 @@ def init_db() -> None:
 
             INSERT OR IGNORE INTO groups (name) VALUES ('Default');
         """)
+        # Idempotent migrations for DBs created before IMAP columns existed.
+        for col in ("imap_email", "imap_password", "imap_host"):
+            try:
+                conn.execute(f"ALTER TABLE accounts ADD COLUMN {col} TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
         conn.close()
 
@@ -174,7 +183,9 @@ def add_account(
     card_number: str = "", card_exp_month: str = "", card_exp_year: str = "", card_cvv: str = "",
     billing_name: str = "", billing_email: str = "", billing_phone: str = "",
     billing_postal: str = "", billing_country: str = "US",
-    proxy: str = "", aycd_key: str = "", group_id: int | None = None,
+    proxy: str = "", aycd_key: str = "",
+    imap_email: str = "", imap_password: str = "", imap_host: str = "",
+    group_id: int | None = None,
 ) -> int:
     with _lock:
         conn = _connect()
@@ -182,11 +193,11 @@ def add_account(
             INSERT OR REPLACE INTO accounts
             (name, phone, email, card_number, card_exp_month, card_exp_year, card_cvv,
              billing_name, billing_email, billing_phone, billing_postal, billing_country,
-             proxy, aycd_key, group_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             proxy, aycd_key, imap_email, imap_password, imap_host, group_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (name, phone, email, card_number, card_exp_month, card_exp_year, card_cvv,
               billing_name, billing_email, billing_phone, billing_postal, billing_country,
-              proxy, aycd_key, group_id))
+              proxy, aycd_key, imap_email, imap_password, imap_host, group_id))
         conn.commit()
         aid = cur.lastrowid
         conn.close()
@@ -198,7 +209,7 @@ def update_account(account_id: int, **fields) -> None:
     if not fields: return
     allowed = {"name","phone","email","card_number","card_exp_month","card_exp_year","card_cvv",
                 "billing_name","billing_email","billing_phone","billing_postal","billing_country",
-                "proxy","aycd_key","group_id"}
+                "proxy","aycd_key","imap_email","imap_password","imap_host","group_id"}
     sets = [f"{k} = ?" for k in fields if k in allowed]
     vals = [fields[k] for k in fields if k in allowed]
     if not sets: return
@@ -273,6 +284,9 @@ def _import_rows(rows: list[dict], group_id: int | None = None) -> int:
             billing_country=_country(_col(cleaned, "country", "billingcountry") or "US"),
             proxy=_col(cleaned, "proxy"),
             aycd_key=_col(cleaned, "aycdkey", "aycd", "aycdapikey"),
+            imap_email=_col(cleaned, "imapemail", "imapuser", "imapusername", "imaplogin"),
+            imap_password=_col(cleaned, "imappassword", "imappass", "imapapppassword", "imaptoken"),
+            imap_host=_col(cleaned, "imaphost", "imapserver"),
             group_id=group_id,
         )
         count += 1
