@@ -266,6 +266,17 @@
         </div>
 
         <div class="panel">
+          <div class="panel-title">Auth farm</div>
+          <div class="form-grid">
+            <label>
+              <span>Concurrency (parallel logins — 1 = sequential)</span>
+              <input type="number" min="1" max="100" step="1" id="farmConcurrency" placeholder="10" />
+            </label>
+            <p class="muted" style="font-size:11px; margin:-6px 0 0;">Each worker runs its own Chrome + proxy. Shared IMAP inboxes are demultiplexed by the account's <code>email</code> (To: header filter) and capped at 10 concurrent IMAP sessions per inbox.</p>
+          </div>
+        </div>
+
+        <div class="panel">
           <div class="panel-title">Defaults</div>
           <div class="form-grid">
             <label>

@@ -30,7 +30,7 @@ contextBridge.exposeInMainWorld("api", {
 
   // Auth / cart / task runners
   authLoginOne: (account) => ipcRenderer.invoke("auth:login-one", { account }),
-  authFarm: (accounts) => ipcRenderer.invoke("auth:farm", { accounts }),
+  authFarm: (accounts, concurrency) => ipcRenderer.invoke("auth:farm", { accounts, concurrency }),
   cartRun: (payload) => ipcRenderer.invoke("cart:run", payload),
   taskRun: (payload) => ipcRenderer.invoke("task:run", payload),
   taskStop: (task_id) => ipcRenderer.invoke("task:stop", { task_id }),

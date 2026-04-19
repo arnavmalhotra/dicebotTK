@@ -363,6 +363,7 @@ def login_single_account(
     imap_email: str | None = None,
     imap_password: str | None = None,
     imap_host: str = "imap.gmail.com",
+    imap_recipient: str | None = None,
     log_fn=None,
     on_driver=None,
 ) -> dict:
@@ -428,7 +429,16 @@ def login_single_account(
             otp_code = fetch_otp_aycd(api_key=aycd_key, email=email, log_fn=log)
         if not otp_code and imap_email and imap_password:
             log(f"Fetching OTP via IMAP ({imap_email})...")
-            otp_code = fetch_otp_imap(imap_email=imap_email, imap_password=imap_password, imap_host=imap_host, log_fn=log)
+            # imap_recipient is passed explicitly by the caller (the Dice
+            # account email — what the OTP was sent to). Fall back to `email`
+            # only if not provided.
+            otp_code = fetch_otp_imap(
+                imap_email=imap_email,
+                imap_password=imap_password,
+                imap_host=imap_host,
+                recipient_email=imap_recipient if imap_recipient is not None else email,
+                log_fn=log,
+            )
 
         if not otp_code:
             return {"ok": False, "error": "Could not retrieve OTP code"}

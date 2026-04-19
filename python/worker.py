@@ -385,6 +385,7 @@ def _run_login_one(sid: str, params: dict, stop_evt: threading.Event, otp_holder
         imap_email=account.get("imap_email"),
         imap_password=account.get("imap_password"),
         imap_host=account.get("imap_host") or "imap.gmail.com",
+        imap_recipient=account.get("email") or "",
         log_fn=log,
         on_driver=lambda d: driver_holder.update(driver=d),
     )
@@ -408,17 +409,56 @@ def m_auth_login_one(params):
 
 def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dict, driver_holder: dict, approve_evt: threading.Event):
     import auth_harvester
+    from concurrent.futures import ThreadPoolExecutor
 
     accounts = params.get("accounts") or []
-    log = _log_fn_for(sid)
-    _event(sid, type="status", status="starting", total=len(accounts))
+    try:
+        concurrency = max(1, int(params.get("concurrency") or 1))
+    except (TypeError, ValueError):
+        concurrency = 1
+    concurrency = min(concurrency, max(1, len(accounts)))
 
-    for idx, account in enumerate(accounts, start=1):
+    log = _log_fn_for(sid)
+    _event(sid, type="status", status="starting", total=len(accounts), concurrency=concurrency)
+    log(f"Farm starting — {len(accounts)} accounts, concurrency={concurrency}")
+
+    # Promote driver_holder to a multi-driver shape so parallel workers can
+    # all be interrupted by a single m_session_stop. We keep the legacy
+    # "driver" key working too by leaving it unset here.
+    driver_holder.setdefault("drivers", set())
+    driver_holder.setdefault("lock", threading.Lock())
+
+    def _register_driver(d):
+        if d is None:
+            return
+        with driver_holder["lock"]:
+            driver_holder["drivers"].add(d)
+
+    def _unregister_driver(d):
+        if d is None:
+            return
+        with driver_holder["lock"]:
+            driver_holder["drivers"].discard(d)
+
+    completed = {"n": 0}
+    completed_lock = threading.Lock()
+
+    def _run_one(idx: int, account: dict):
         if stop_evt.is_set():
-            log("Stop requested. Ending farm.", "warning")
-            break
-        log(f"[{idx}/{len(accounts)}] {account['phone']}")
-        country_iso, local_digits = _split_phone(account.get("phone") or "")
+            return
+        phone = account.get("phone") or ""
+        prefix = f"[{idx}/{len(accounts)}] {phone}"
+        log(f"{prefix} starting")
+        country_iso, local_digits = _split_phone(phone)
+        my_driver = {"d": None}
+
+        def _capture_driver(d):
+            my_driver["d"] = d
+            _register_driver(d)
+
+        def _wlog(msg, level="info"):
+            log(f"{prefix}: {msg}", level)
+
         try:
             result = auth_harvester.login_single_account(
                 phone=local_digits,
@@ -430,20 +470,43 @@ def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder
                 imap_email=account.get("imap_email"),
                 imap_password=account.get("imap_password"),
                 imap_host=account.get("imap_host") or "imap.gmail.com",
-                log_fn=log,
-                on_driver=lambda d: driver_holder.update(driver=d),
+                imap_recipient=account.get("email") or "",
+                log_fn=_wlog,
+                on_driver=_capture_driver,
             )
-            driver_holder["driver"] = None
             if result.get("ok") and result.get("bearer_token"):
-                db.save_session(int(account["id"]), result["bearer_token"], phone=account["phone"])
+                try:
+                    db.save_session(int(account["id"]), result["bearer_token"], phone=phone)
+                except Exception as exc:
+                    _wlog(f"DB save failed: {exc}", "error")
                 _event(sid, type="auth_update", account_id=account["id"], status="ok")
             else:
-                _event(sid, type="auth_update", account_id=account["id"], status="fail", error=result.get("error"))
+                _event(sid, type="auth_update", account_id=account["id"], status="fail",
+                       error=result.get("error"))
         except Exception as exc:
-            log(f"{account['phone']}: {exc}", "error")
+            _wlog(f"error: {exc}", "error")
             _event(sid, type="auth_update", account_id=account["id"], status="fail", error=str(exc))
+        finally:
+            _unregister_driver(my_driver["d"])
+            with completed_lock:
+                completed["n"] += 1
+                n = completed["n"]
+            _event(sid, type="progress", done=n, total=len(accounts))
 
-    _event(sid, type="done", ok=True)
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = [ex.submit(_run_one, i, acct) for i, acct in enumerate(accounts, start=1)]
+        for f in futures:
+            try:
+                f.result()
+            except Exception as exc:
+                log(f"Worker crashed: {exc}", "error")
+
+    if stop_evt.is_set():
+        log("Farm stopped by user.", "warning")
+        _event(sid, type="done", ok=False, error="stopped")
+    else:
+        log(f"Farm finished — {completed['n']}/{len(accounts)} accounts processed.")
+        _event(sid, type="done", ok=True)
 
 
 def m_auth_farm(params):
@@ -704,12 +767,28 @@ def m_session_stop(params):
     if not sess:
         return {"ok": False, "error": "session not found"}
     sess["stop"].set()
-    driver = (sess.get("driver_holder") or {}).get("driver")
-    if driver is not None:
+    dh = sess.get("driver_holder") or {}
+    # Legacy single-driver shape (login_one, cart, task runners).
+    d = dh.get("driver")
+    if d is not None:
         try:
-            driver.quit()
+            d.quit()
         except Exception:
             pass
+    # Multi-driver shape (parallel auth farm).
+    drivers = dh.get("drivers")
+    if drivers:
+        lock = dh.get("lock")
+        if lock is not None:
+            with lock:
+                to_quit = list(drivers)
+        else:
+            to_quit = list(drivers)
+        for drv in to_quit:
+            try:
+                drv.quit()
+            except Exception:
+                pass
     return {"ok": True}
 
 

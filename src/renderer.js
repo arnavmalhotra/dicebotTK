@@ -51,6 +51,7 @@ function hydrateSettingsForm() {
   $("#twocaptchaKey").value = state.settings.twocaptchaKey || "";
   $("#captchafunKey").value = state.settings.captchafunKey || "";
   $("#aycdKey").value = state.settings.aycdKey || "";
+  $("#farmConcurrency").value = state.settings.farmConcurrency ?? "";
   $("#defaultMinPrice").value = state.settings.defaultMinPrice ?? "";
   $("#defaultMaxPrice").value = state.settings.defaultMaxPrice ?? "";
   $("#defaultTier").value = state.settings.defaultTier || "";
@@ -61,6 +62,7 @@ $("#saveSettingsBtn").addEventListener("click", () => {
     twocaptchaKey: $("#twocaptchaKey").value.trim(),
     captchafunKey: $("#captchafunKey").value.trim(),
     aycdKey: $("#aycdKey").value.trim(),
+    farmConcurrency: parseInt($("#farmConcurrency").value, 10) || null,
     defaultMinPrice: parseFloat($("#defaultMinPrice").value) || null,
     defaultMaxPrice: parseFloat($("#defaultMaxPrice").value) || null,
     defaultTier: $("#defaultTier").value.trim(),
@@ -242,7 +244,7 @@ $("#bulkAuthBtn").addEventListener("click", async () => {
   if (!ids.length) return;
   const accts = await Promise.all(ids.map((id) => api.getAccount(id)));
   const queue = accts.filter((r) => r.ok).map((r) => r.data);
-  const r = await api.authFarm(queue);
+  const r = await api.authFarm(queue, farmConcurrency());
   if (r.ok) {
     state.authFarm.sessionId = r.data.session_id;
     state.authFarm.running = true;
@@ -449,7 +451,7 @@ $("#refreshAuthBtn").addEventListener("click", refreshAuthFarm);
 $("#startFarmBtn").addEventListener("click", async () => {
   const pending = await api.getAccountsNeedingAuth();
   if (!pending.ok || !pending.data?.length) { appendFarmLog("No accounts need auth.", "info"); return; }
-  const r = await api.authFarm(pending.data);
+  const r = await api.authFarm(pending.data, farmConcurrency());
   if (r.ok) {
     state.authFarm.sessionId = r.data.session_id;
     state.authFarm.running = true;
@@ -543,6 +545,11 @@ function renderCartCard(cart) {
     if (!r.ok) card.textContent = "approve failed: " + r.error;
   });
   return el;
+}
+
+function farmConcurrency() {
+  const n = parseInt(state.settings.farmConcurrency, 10);
+  return Number.isFinite(n) && n > 0 ? n : 1;
 }
 
 function browserTz() {
