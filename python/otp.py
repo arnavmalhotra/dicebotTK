@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import re
 import threading
 import time
@@ -15,6 +16,12 @@ from datetime import datetime, timedelta
 _IMAP_MAX_CONCURRENT = 10
 _IMAP_SEM_REGISTRY: dict[tuple[str, str], threading.Semaphore] = {}
 _IMAP_SEM_LOCK = threading.Lock()
+_OTP_PATTERNS = [
+    re.compile(r"login code[:\s-]*(\d{4,6})", re.I),
+    re.compile(r"dice[^0-9]{0,40}(\d{4,6})", re.I),
+    re.compile(r"\b(\d{4,6})\b"),
+]
+_RECEIVED_FOR_PATTERN = re.compile(r"for\s+<?([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})>?", re.I)
 
 
 def _imap_semaphore(host: str, email: str) -> threading.Semaphore:
@@ -32,6 +39,102 @@ def _imap_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _decode_mime_header(value: str) -> str:
+    from email.header import decode_header
+
+    decoded = ""
+    for part, charset in decode_header(value or ""):
+        if isinstance(part, bytes):
+            decoded += part.decode(charset or "utf-8", errors="replace")
+        else:
+            decoded += part
+    return decoded
+
+
+def _extract_message_text(msg) -> str:
+    chunks: list[str] = []
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_maintype() == "multipart":
+                continue
+            disposition = str(part.get("Content-Disposition") or "").lower()
+            if "attachment" in disposition:
+                continue
+            try:
+                payload = part.get_payload(decode=True)
+                charset = part.get_content_charset() or "utf-8"
+                text = payload.decode(charset, errors="replace") if payload else ""
+            except Exception:
+                text = ""
+            if not text:
+                continue
+            if part.get_content_type() == "text/html":
+                text = re.sub(r"<[^>]+>", " ", html.unescape(text))
+            chunks.append(text)
+    else:
+        try:
+            payload = msg.get_payload(decode=True)
+            charset = msg.get_content_charset() or "utf-8"
+            text = payload.decode(charset, errors="replace") if payload else ""
+        except Exception:
+            text = ""
+        if text:
+            if msg.get_content_type() == "text/html":
+                text = re.sub(r"<[^>]+>", " ", html.unescape(text))
+            chunks.append(text)
+    return "\n".join(chunks)
+
+
+def _extract_otp_code(subject: str, message_text: str) -> str | None:
+    haystacks = [subject or "", message_text or ""]
+    for haystack in haystacks:
+        if not haystack:
+            continue
+        for pattern in _OTP_PATTERNS:
+            match = pattern.search(haystack)
+            if match:
+                return match.group(1)
+    return None
+
+
+def _extract_header_recipients(msg) -> set[str]:
+    from email.utils import getaddresses
+
+    recipients: set[str] = set()
+    recipient_headers = [
+        msg.get("To", ""),
+        msg.get("Delivered-To", ""),
+        msg.get("X-Forwarded-To", ""),
+        msg.get("X-Original-To", ""),
+        msg.get("Envelope-To", ""),
+        msg.get("X-Envelope-To", ""),
+        msg.get("Original-Recipient", ""),
+        msg.get("Resent-To", ""),
+        msg.get("Cc", ""),
+    ]
+    for _name, addr in getaddresses(recipient_headers):
+        clean = (addr or "").strip().lower()
+        if clean:
+            recipients.add(clean)
+    for received in msg.get_all("Received", []):
+        for match in _RECEIVED_FOR_PATTERN.findall(received or ""):
+            clean = (match or "").strip().lower()
+            if clean:
+                recipients.add(clean)
+    return recipients
+
+
+def _sender_matches(msg) -> bool:
+    sender_blob = " ".join([
+        _decode_mime_header(msg.get("From", "")),
+        _decode_mime_header(msg.get("Reply-To", "")),
+        _decode_mime_header(msg.get("Return-Path", "")),
+    ]).lower()
+    if "noreply@dice.fm" in sender_blob:
+        return True
+    return "dice.fm" in sender_blob
+
+
 def fetch_otp_imap(
     imap_email: str,
     imap_password: str,
@@ -44,27 +147,24 @@ def fetch_otp_imap(
 ) -> str | None:
     """Poll an IMAP inbox for the latest Dice OTP email and return the 4-digit code.
 
-    If recipient_email is set (and differs from imap_email) the IMAP search is
-    restricted to messages with that To: header. This lets many accounts share
-    a single forwarded inbox without stealing each other's OTPs.
+    If recipient_email is set, recipient headers are checked locally after fetch.
+    This lets many accounts share a single forwarded inbox without stealing each
+    other's OTPs, even when IMAP server-side TO filtering is unreliable.
     """
     import imaplib
     import email as email_lib
-    from email.header import decode_header
     from email.utils import parsedate_to_datetime
 
     log = log_fn or (lambda msg, level="info": print(f"[{level}] {msg}"))
     start_time = time.time()
 
-    to_filter = None
-    if recipient_email and recipient_email.strip() and recipient_email.strip().lower() != imap_email.strip().lower():
-        to_filter = recipient_email.strip()
+    recipient_filter = str(recipient_email or "").strip().lower()
 
     sem = _imap_semaphore(imap_host, imap_email)
     sem.acquire()
     try:
         log(f"Connecting to IMAP ({imap_host}:{imap_port}) as {imap_email}"
-            + (f" (filter TO={to_filter})" if to_filter else "") + "...")
+            + (f" (recipient={recipient_filter})" if recipient_filter else "") + "...")
         try:
             mail = imaplib.IMAP4_SSL(imap_host, imap_port)
             mail.login(imap_email, imap_password)
@@ -72,44 +172,45 @@ def fetch_otp_imap(
             log(f"IMAP login failed: {exc}", "error")
             return None
 
-        # Build the IMAP SEARCH criteria. Parts are space-joined inside parens.
-        parts = ['FROM "noreply@dice.fm"', 'SUBJECT "Login code"']
-        if to_filter:
-            parts.append(f'TO "{_imap_escape(to_filter)}"')
-        search_arg = "(" + " ".join(parts) + ")"
-
         try:
             deadline = start_time + timeout_seconds
+            recipient_mismatch_logged = False
+            dice_candidate_logged = False
             while time.time() < deadline:
                 try:
                     mail.select("INBOX")
-                    status, msg_ids = mail.search(None, search_arg)
+                    status, msg_ids = mail.search(None, "ALL")
                     if status != "OK" or not msg_ids or not msg_ids[0]:
                         time.sleep(poll_interval)
                         continue
 
-                    # Walk newest → oldest so we pick the freshest matching mail.
                     id_list = msg_ids[0].split()
-                    picked = None
-                    for mid in reversed(id_list):
+                    dice_candidates = 0
+
+                    for mid in reversed(id_list[-60:]):
                         status, msg_data = mail.fetch(mid, "(RFC822)")
                         if status != "OK" or not msg_data or not msg_data[0]:
                             continue
                         raw = msg_data[0][1]
                         msg = email_lib.message_from_bytes(raw)
+                        if not _sender_matches(msg):
+                            continue
 
-                        # Verify To: header matches when a filter was requested.
-                        # IMAP SEARCH TO can be fuzzy on some servers; re-check.
-                        if to_filter:
-                            to_hdr = (msg.get("To", "") or "").lower()
-                            cc_hdr = (msg.get("Cc", "") or "").lower()
-                            delivered_to = (msg.get("Delivered-To", "") or "").lower()
-                            if (to_filter.lower() not in to_hdr
-                                and to_filter.lower() not in cc_hdr
-                                and to_filter.lower() not in delivered_to):
+                        dice_candidates += 1
+
+                        if recipient_filter:
+                            recipients = _extract_header_recipients(msg)
+                            if recipient_filter not in recipients:
+                                if not recipient_mismatch_logged:
+                                    preview = ", ".join(sorted(recipients)) if recipients else "none"
+                                    log(
+                                        f"Recent DICE email found, but its recipient headers did not include {recipient_filter} "
+                                        f"(saw: {preview}).",
+                                        "warning",
+                                    )
+                                    recipient_mismatch_logged = True
                                 continue
 
-                        # Skip old mail that predates this fetch attempt.
                         date_str = msg.get("Date", "")
                         if date_str:
                             try:
@@ -119,31 +220,25 @@ def fetch_otp_imap(
                             except Exception:
                                 pass
 
-                        subject = ""
-                        for part, charset in decode_header(msg.get("Subject", "")):
-                            if isinstance(part, bytes):
-                                subject += part.decode(charset or "utf-8", errors="replace")
-                            else:
-                                subject += part
-
-                        m = re.search(r"Login code:\s*(\d{4})", subject)
-                        if not m:
+                        subject = _decode_mime_header(msg.get("Subject", ""))
+                        message_text = _extract_message_text(msg)
+                        otp_code = _extract_otp_code(subject, message_text)
+                        if not otp_code:
                             continue
-                        picked = (mid, m.group(1))
-                        break
 
-                    if picked is None:
-                        time.sleep(poll_interval)
-                        continue
+                        log(f"OTP code found: {otp_code}")
+                        try:
+                            mail.store(mid, "+FLAGS", "\\Deleted")
+                            mail.expunge()
+                        except Exception:
+                            pass
+                        return otp_code
 
-                    mid, otp_code = picked
-                    log(f"OTP code found: {otp_code}")
-                    try:
-                        mail.store(mid, "+FLAGS", "\\Deleted")
-                        mail.expunge()
-                    except Exception:
-                        pass
-                    return otp_code
+                    if dice_candidates and not dice_candidate_logged:
+                        log(f"Found {dice_candidates} recent DICE email(s) in the inbox. Waiting for a matching OTP...")
+                        dice_candidate_logged = True
+
+                    time.sleep(poll_interval)
 
                 except Exception as exc:
                     log(f"IMAP poll error: {exc}", "warning")
