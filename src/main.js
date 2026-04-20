@@ -3,6 +3,8 @@ const { spawn } = require("node:child_process");
 const path = require("node:path");
 const fs = require("node:fs");
 const readline = require("node:readline");
+const { Readable } = require("node:stream");
+const { pipeline } = require("node:stream/promises");
 
 let mainWindow = null;
 let pyProc = null;
@@ -10,6 +12,210 @@ let pyReady = false;
 const pending = new Map();
 let nextId = 1;
 const readyWaiters = [];
+let updateCheckTimer = null;
+let updateCheckInFlight = false;
+let pendingInstallerPath = null;
+let currentDownloadPromise = null;
+let updateState = {
+  status: "idle",
+  currentVersion: app.getVersion(),
+  latestVersion: "",
+  mode: process.platform,
+  downloadUrl: "",
+  extraDownloadUrl: "",
+  releasePageUrl: "",
+  error: "",
+};
+
+const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const UPDATE_CONFIG = {
+  appId: "dicebotticketkings",
+  productName: "DiceBotTicketKings",
+  manifestUrl: "https://dl.tieroneonly.com/latest/DiceBotTicketKings-update.json",
+  windowsUrl: "https://dl.tieroneonly.com/latest/DiceBotTicketKings-win.exe",
+  macDmgUrl: "https://dl.tieroneonly.com/latest/DiceBotTicketKings-mac.dmg",
+  macZipUrl: "https://dl.tieroneonly.com/latest/DiceBotTicketKings-mac.zip",
+};
+
+function setUpdateState(patch) {
+  updateState = {
+    ...updateState,
+    ...patch,
+    currentVersion: app.getVersion(),
+  };
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
+    mainWindow.webContents.send("update:event", updateState);
+  }
+}
+
+function normalizeVersion(value) {
+  return String(value || "").trim().replace(/^v/i, "");
+}
+
+function compareVersions(a, b) {
+  const left = normalizeVersion(a).split(".").map((part) => parseInt(part, 10) || 0);
+  const right = normalizeVersion(b).split(".").map((part) => parseInt(part, 10) || 0);
+  const len = Math.max(left.length, right.length);
+  for (let i = 0; i < len; i += 1) {
+    const diff = (left[i] || 0) - (right[i] || 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+async function fetchUpdateManifest() {
+  const response = await fetch(UPDATE_CONFIG.manifestUrl, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": `${UPDATE_CONFIG.productName}/${app.getVersion()}`,
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`Update manifest request failed (${response.status})`);
+  }
+  const data = await response.json();
+  return {
+    version: normalizeVersion(data.version || data.release_tag || ""),
+    releasePageUrl: data.release_page_url || "",
+    windowsUrl: data.windows?.url || data.windows_url || UPDATE_CONFIG.windowsUrl,
+    macDmgUrl: data.mac?.dmg_url || data.mac_dmg_url || UPDATE_CONFIG.macDmgUrl,
+    macZipUrl: data.mac?.zip_url || data.mac_zip_url || UPDATE_CONFIG.macZipUrl,
+  };
+}
+
+async function downloadWindowsInstaller(version, downloadUrl) {
+  const updatesDir = path.join(app.getPath("userData"), "updates");
+  fs.mkdirSync(updatesDir, { recursive: true });
+  const targetPath = path.join(updatesDir, `${UPDATE_CONFIG.appId}-${normalizeVersion(version)}-win.exe`);
+  const tempPath = `${targetPath}.download`;
+  if (fs.existsSync(targetPath)) {
+    return targetPath;
+  }
+
+  const response = await fetch(downloadUrl, {
+    headers: {
+      "User-Agent": `${UPDATE_CONFIG.productName}/${app.getVersion()}`,
+    },
+  });
+  if (!response.ok || !response.body) {
+    throw new Error(`Installer download failed (${response.status})`);
+  }
+
+  await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(tempPath));
+  fs.renameSync(tempPath, targetPath);
+  return targetPath;
+}
+
+async function checkForAppUpdates() {
+  if (updateCheckInFlight) return;
+  updateCheckInFlight = true;
+  setUpdateState({ status: "checking", error: "" });
+  try {
+    const release = await fetchUpdateManifest();
+    if (!release.version || compareVersions(release.version, app.getVersion()) <= 0) {
+      setUpdateState({
+        status: "idle",
+        latestVersion: release.version || "",
+        releasePageUrl: release.releasePageUrl || "",
+        downloadUrl: "",
+        extraDownloadUrl: "",
+        error: "",
+      });
+      return;
+    }
+
+    if (process.platform === "win32") {
+      const baseState = {
+        latestVersion: release.version,
+        releasePageUrl: release.releasePageUrl || "",
+        mode: "windows",
+        downloadUrl: release.windowsUrl || UPDATE_CONFIG.windowsUrl,
+        extraDownloadUrl: "",
+        error: "",
+      };
+      if (!app.isPackaged) {
+        setUpdateState({ ...baseState, status: "available" });
+        return;
+      }
+      setUpdateState({ ...baseState, status: "downloading" });
+      currentDownloadPromise = downloadWindowsInstaller(release.version, baseState.downloadUrl);
+      const installerPath = await currentDownloadPromise;
+      pendingInstallerPath = installerPath;
+      setUpdateState({ ...baseState, status: "downloaded" });
+      return;
+    }
+
+    if (process.platform === "darwin") {
+      setUpdateState({
+        status: "available",
+        latestVersion: release.version,
+        releasePageUrl: release.releasePageUrl || "",
+        mode: "mac",
+        downloadUrl: release.macDmgUrl || UPDATE_CONFIG.macDmgUrl,
+        extraDownloadUrl: release.macZipUrl || UPDATE_CONFIG.macZipUrl,
+        error: "",
+      });
+      return;
+    }
+
+    setUpdateState({
+      status: "available",
+      latestVersion: release.version,
+      releasePageUrl: release.releasePageUrl || "",
+      mode: process.platform,
+      downloadUrl: release.releasePageUrl || "",
+      extraDownloadUrl: "",
+      error: "",
+    });
+  } catch (err) {
+    console.error("[update] check failed:", err);
+    if (updateState.latestVersion) {
+      setUpdateState({
+        status: "available",
+        error: err.message || "Update check failed",
+      });
+    } else {
+      setUpdateState({
+        status: "idle",
+        error: "",
+      });
+    }
+  } finally {
+    currentDownloadPromise = null;
+    updateCheckInFlight = false;
+  }
+}
+
+function scheduleUpdateChecks() {
+  checkForAppUpdates();
+  if (updateCheckTimer) clearInterval(updateCheckTimer);
+  updateCheckTimer = setInterval(checkForAppUpdates, UPDATE_CHECK_INTERVAL_MS);
+}
+
+async function installDownloadedUpdate() {
+  if (process.platform !== "win32") {
+    throw new Error("Install is only available on Windows");
+  }
+  if (currentDownloadPromise) {
+    await currentDownloadPromise;
+  }
+  if (!pendingInstallerPath || !fs.existsSync(pendingInstallerPath)) {
+    throw new Error("No downloaded update is ready yet");
+  }
+
+  app.once("will-quit", () => {
+    try {
+      const child = spawn(pendingInstallerPath, [], {
+        detached: true,
+        stdio: "ignore",
+      });
+      child.unref();
+    } catch (err) {
+      console.error("[update] failed to launch installer:", err);
+    }
+  });
+  app.quit();
+}
 
 // ── Python worker location ────────────────────────────────────────────────
 function resolveWorker() {
@@ -131,6 +337,9 @@ function createWindow() {
   });
   mainWindow.setMenuBarVisibility(false);
   mainWindow.loadFile(path.join(__dirname, "index.html"));
+  mainWindow.webContents.on("did-finish-load", () => {
+    mainWindow?.webContents.send("update:event", updateState);
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
@@ -219,6 +428,16 @@ function registerIpc() {
     fs.writeFileSync(filePath, header + sample);
     return { ok: true, filePath };
   });
+
+  ipcMain.handle("update:get-state", async () => ({ ...updateState }));
+  ipcMain.handle("update:install", async () => {
+    try {
+      await installDownloadedUpdate();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
 }
 
 // ── App lifecycle ─────────────────────────────────────────────────────────
@@ -226,12 +445,14 @@ app.whenReady().then(() => {
   startPython();
   registerIpc();
   createWindow();
+  scheduleUpdateChecks();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
 
 app.on("window-all-closed", () => {
+  if (updateCheckTimer) clearInterval(updateCheckTimer);
   if (pyProc && !pyProc.killed) {
     try { pyProc.stdin.end(); } catch {}
     try { pyProc.kill(); } catch {}

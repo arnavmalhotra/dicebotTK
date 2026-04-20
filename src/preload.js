@@ -41,6 +41,8 @@ contextBridge.exposeInMainWorld("api", {
   // Shell helpers
   openExternal: (url) => ipcRenderer.invoke("shell:open-external", url),
   saveSample: invoke("dialog:save-sample"),
+  getUpdateState: invoke("update:get-state"),
+  installUpdate: invoke("update:install"),
 
   // Events
   onEvent: (cb) => {
@@ -52,5 +54,10 @@ contextBridge.exposeInMainWorld("api", {
     const listener = (_e, msg) => cb(msg);
     ipcRenderer.on("worker:log", listener);
     return () => ipcRenderer.removeListener("worker:log", listener);
+  },
+  onUpdateEvent: (cb) => {
+    const listener = (_e, msg) => cb(msg);
+    ipcRenderer.on("update:event", listener);
+    return () => ipcRenderer.removeListener("update:event", listener);
   },
 });

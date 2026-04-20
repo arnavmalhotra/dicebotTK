@@ -144,10 +144,13 @@ jobs:
           AWS_EC2_METADATA_DISABLED: "true"
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
         shell: bash
         run: |
           endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           tag="${GITHUB_REF_NAME}"
+          base="${R2_PUBLIC_BASE_URL%/}"
+          clean_tag="${tag#v}"
 
           mapfile -d '' files < <(find release-artifacts -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) -print0 | sort -z)
           for file in "${files[@]}"; do
@@ -159,10 +162,31 @@ jobs:
           dmg="$(find release-artifacts -name '*.dmg' | head -n1)"
           maczip="$(find release-artifacts -name '*-mac.zip' | head -n1)"
           winexe="$(find release-artifacts -name '*-win.exe' | head -n1)"
+          dmg_name="$(basename "${dmg}")"
+          maczip_name="$(basename "${maczip}")"
+          winexe_name="$(basename "${winexe}")"
 
           [ -n "${dmg}" ] && aws --endpoint-url "${endpoint}" s3 cp "${dmg}" "s3://${R2_BUCKET}/latest/DiceBotTicketKings-mac.dmg"
           [ -n "${maczip}" ] && aws --endpoint-url "${endpoint}" s3 cp "${maczip}" "s3://${R2_BUCKET}/latest/DiceBotTicketKings-mac.zip"
           [ -n "${winexe}" ] && aws --endpoint-url "${endpoint}" s3 cp "${winexe}" "s3://${R2_BUCKET}/latest/DiceBotTicketKings-win.exe"
+
+          cat > update-manifest.json <<EOF
+          {
+            "version": "${clean_tag}",
+            "release_tag": "${tag}",
+            "mac": {
+              "dmg_url": "${base}/ticketkings-releases/${tag}/${dmg_name}",
+              "zip_url": "${base}/ticketkings-releases/${tag}/${maczip_name}",
+              "latest_dmg_url": "${base}/latest/DiceBotTicketKings-mac.dmg",
+              "latest_zip_url": "${base}/latest/DiceBotTicketKings-mac.zip"
+            },
+            "windows": {
+              "url": "${base}/ticketkings-releases/${tag}/${winexe_name}",
+              "latest_url": "${base}/latest/DiceBotTicketKings-win.exe"
+            }
+          }
+          EOF
+          aws --endpoint-url "${endpoint}" s3 cp update-manifest.json "s3://${R2_BUCKET}/latest/DiceBotTicketKings-update.json" --content-type application/json
 
       - name: Write download summary
         env:
@@ -176,6 +200,7 @@ jobs:
             echo "- ${base}/latest/DiceBotTicketKings-mac.dmg"
             echo "- ${base}/latest/DiceBotTicketKings-mac.zip"
             echo "- ${base}/latest/DiceBotTicketKings-win.exe"
+            echo "- ${base}/latest/DiceBotTicketKings-update.json"
             echo
             echo "Versioned: ${base}/ticketkings-releases/${GITHUB_REF_NAME}/"
           } >> "$GITHUB_STEP_SUMMARY"

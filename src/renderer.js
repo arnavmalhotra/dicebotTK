@@ -14,6 +14,7 @@ const state = {
   selectedTasks: new Set(),
   taskSearch: "",
   authFarm: { sessionId: null, running: false, accountStatus: new Map() },
+  update: null,
   settings: loadSettings(),
 };
 
@@ -27,6 +28,93 @@ function loadSettings() {
 function saveSettings(patch) {
   state.settings = { ...state.settings, ...patch };
   localStorage.setItem("dicebot.settings", JSON.stringify(state.settings));
+}
+
+function formatVersionLabel(version) {
+  const clean = String(version || "").replace(/^v/i, "").trim();
+  return clean ? `v${clean}` : "";
+}
+
+function setUpdateState(nextState) {
+  state.update = nextState || null;
+  renderUpdateBanner();
+}
+
+function renderUpdateBanner() {
+  const root = $("#updateBanner");
+  if (!root) return;
+  const update = state.update;
+  if (!update || !update.status || update.status === "idle" || update.status === "checking") {
+    root.hidden = true;
+    root.innerHTML = "";
+    return;
+  }
+
+  const versionLabel = formatVersionLabel(update.latestVersion);
+  const links = [];
+  let title = "";
+  let message = "";
+  let actionsHtml = "";
+
+  if (update.mode === "mac") {
+    title = `${versionLabel || "A new version"} is available`;
+    message = "A newer macOS build is ready. Copy one of the links below to download it.";
+    if (update.downloadUrl) links.push({ label: "DMG", value: update.downloadUrl });
+    if (update.extraDownloadUrl) links.push({ label: "ZIP", value: update.extraDownloadUrl });
+  } else if (update.mode === "windows" && update.status === "downloading") {
+    title = `${versionLabel || "A new version"} is available`;
+    message = "Downloading the Windows installer in the background now. You will be able to install it from here once the download finishes.";
+    if (update.downloadUrl) links.push({ label: "Installer link", value: update.downloadUrl });
+  } else if (update.mode === "windows" && update.status === "downloaded") {
+    title = `${versionLabel || "A new version"} is ready`;
+    message = "The update has finished downloading. Click Install update to close DiceBotTicketKings and launch the new installer.";
+    if (update.downloadUrl) links.push({ label: "Installer link", value: update.downloadUrl });
+    actionsHtml = `<button class="btn btn-primary" id="installUpdateBtn">Install update</button>`;
+  } else if (update.mode === "windows") {
+    title = `${versionLabel || "A new version"} is available`;
+    message = "A newer Windows build is available.";
+    if (update.error) {
+      message += ` Automatic download failed: ${update.error}`;
+    } else if (!update.downloadUrl) {
+      message += " Download it manually from the link below.";
+    }
+    if (update.downloadUrl) links.push({ label: "Installer link", value: update.downloadUrl });
+  } else {
+    title = `${versionLabel || "A new version"} is available`;
+    message = update.error || "A newer build is available.";
+    if (update.downloadUrl) links.push({ label: "Download link", value: update.downloadUrl });
+  }
+
+  root.innerHTML = `
+    <div class="update-banner-content">
+      <div class="update-banner-title">${escapeHtml(title)}</div>
+      <div class="update-banner-text">${escapeHtml(message)}</div>
+      ${links.length ? `
+        <div class="update-banner-links">
+          ${links.map((link) => `
+            <div class="update-link-block">
+              <div class="update-link-label">${escapeHtml(link.label)}</div>
+              <textarea class="update-link-input" readonly rows="2">${link.value}</textarea>
+            </div>
+          `).join("")}
+        </div>
+      ` : ""}
+    </div>
+    ${actionsHtml ? `<div class="update-banner-actions">${actionsHtml}</div>` : ""}
+  `;
+  root.hidden = false;
+
+  const installBtn = $("#installUpdateBtn");
+  if (installBtn) {
+    installBtn.addEventListener("click", async () => {
+      installBtn.disabled = true;
+      const res = await api.installUpdate();
+      if (!res.ok) {
+        installBtn.disabled = false;
+        alert(res.error || "Could not launch the installer.");
+      }
+    });
+  }
 }
 
 // ── Page switching ────────────────────────────────────────────────────────
