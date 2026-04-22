@@ -153,8 +153,22 @@ def m_db_assign_group(params):
 
 def m_db_import_file(params):
     gid = params.get("group_id")
-    count = db.import_file(params["file_path"], int(gid) if gid is not None else None)
-    return {"count": count}
+    result = db.import_file(params["file_path"], int(gid) if gid is not None else None)
+    # result is already {count, created, updated, skipped, log}
+    return result
+
+
+def m_db_import_tasks_file(params):
+    return db.import_tasks_file(params["file_path"])
+
+
+def m_db_get_inventory(_):
+    return db.get_inventory_items()
+
+
+def m_db_delete_inventory_item(params):
+    db.delete_inventory_item(int(params["item_id"]))
+    return {"ok": True}
 
 
 def m_db_get_stats(_):
@@ -645,29 +659,80 @@ def _run_cart_inner(
     )
 
     if ok:
-        emit_update(status="purchased", purchase_id=client.purchaseId)
+        quantity = int(client.purchaseQuantity or params.get("quantity") or 1)
+        ticket_price = float(client.ticketPrice or 0)
+        total_price = ticket_price * quantity
+        try:
+            db.record_inventory_purchase(
+                record_key=(f"purchase:{client.purchaseId}" if client.purchaseId else f"session:{sid}"),
+                purchase_id=client.purchaseId or "",
+                account_id=int(account.get("id") or 0) or None,
+                account_name=account.get("name") or "",
+                account_phone=account.get("phone") or "",
+                event_url=client.eventUrl or event_url,
+                event_name=client.eventName or "",
+                event_date=client.eventDate or "",
+                event_venue=client.eventVenue or "",
+                ticket_type_id=str(client.ticketTypeId or ""),
+                ticket_name=client.ticketName or "",
+                ticket_currency=client.ticketCurrency or "USD",
+                ticket_price=ticket_price,
+                quantity=quantity,
+                total_price=total_price,
+                purchase_status="purchased",
+                purchased_at=_ts(),
+            )
+            _event(sid, type="inventory_update")
+        except Exception as exc:
+            log(f"Inventory record failed: {exc}", "warning")
+        emit_update(
+            status="purchased",
+            purchase_id=client.purchaseId,
+            quantity=quantity,
+            total_price=total_price,
+            event_name=client.eventName,
+            ticket_name=client.ticketName,
+            ticket_price=client.ticketPrice,
+            ticket_currency=client.ticketCurrency,
+        )
         return True, ""
     emit_update(status="purchase_failed")
     return False, "Purchase failed — see logs"
 
 
-def _run_cart(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dict, driver_holder: dict, approve_evt: threading.Event):
-    account = params["account"]
-    event_url = params["event_url"]
-    try:
-        ok, err = _run_cart_inner(sid, account, event_url, params, stop_evt, driver_holder, approve_evt)
-        _event(sid, type="done", ok=ok, error=err or None)
-    except Exception as exc:
-        _event(sid, type="log", level="error", message=f"Cart run failed: {exc}")
-        _event(sid, type="done", ok=False, error=str(exc))
-
-
 def m_cart_run(params):
+    """Quick one-off purchase. Creates an ephemeral task row and runs it via
+    the same _run_task path as persistent tasks. The row is deleted on
+    terminal status so it never appears on the Tasks page."""
     account = params.get("account") or {}
-    if not db.account_has_valid_session(int(account.get("id") or 0)):
+    account_id = int(account.get("id") or 0)
+    if not db.account_has_valid_session(account_id):
         raise RuntimeError("Account has no valid session — run Auth Farm first")
-    sid = _start_session("cart", _run_cart, params)
-    return {"session_id": sid}
+
+    event_url = (params.get("event_url") or "").strip()
+    if not event_url:
+        raise RuntimeError("event_url is required")
+
+    tid = db.create_task(
+        account_id=account_id,
+        event_url=event_url,
+        min_price=params.get("target_min_price") or params.get("min_price"),
+        max_price=params.get("target_max_price") or params.get("max_price"),
+        presale_code=params.get("presale_code") or "",
+        ticket_tier=params.get("ticket_tier") or "",
+        quantity=params.get("quantity") or 1,
+        mode=params.get("mode") or "auto",
+        ephemeral=True,
+    )
+    task = db.get_task(tid)
+
+    sid = _start_session("task", _run_task, {
+        "task": task,
+        "account": db.get_account(account_id) or account,
+        "capsolver_key": params.get("capsolver_key"),
+        "twocaptcha_key": params.get("twocaptcha_key"),
+    })
+    return {"session_id": sid, "task_id": tid}
 
 
 # ── Task runner ────────────────────────────────────────────────────────────
@@ -710,8 +775,15 @@ def _run_task(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dic
             status = "done"
         else:
             status = "failed"
-        db.set_task_status(task_id, status, session_id="", last_error=err)
-        _event(sid, type="task_update", task_id=task_id, status=status, error=err or None)
+        ephemeral = bool(task.get("ephemeral"))
+        if ephemeral:
+            # Quick-runs vanish once they terminate — their state lived
+            # only to unify the runner. The dashboard card still shows
+            # the final status because the event goes out below.
+            db.delete_task(task_id)
+        else:
+            db.set_task_status(task_id, status, session_id="", last_error=err)
+        _event(sid, type="task_update", task_id=task_id, status=status, error=err or None, ephemeral=ephemeral)
         _event(sid, type="done", ok=ok, error=err or None)
 
 
@@ -827,6 +899,9 @@ METHODS = {
     "db.delete_account": m_db_delete_account,
     "db.assign_group": m_db_assign_group,
     "db.import_file": m_db_import_file,
+    "db.import_tasks_file": m_db_import_tasks_file,
+    "db.get_inventory": m_db_get_inventory,
+    "db.delete_inventory_item": m_db_delete_inventory_item,
     "db.get_stats": m_db_get_stats,
     "db.get_accounts_needing_auth": m_db_get_accounts_needing_auth,
     "db.get_accounts_with_valid_session": m_db_get_accounts_with_valid_session,
@@ -872,6 +947,12 @@ def main() -> int:
         db.init_db()
     except Exception as exc:
         emit({"type": "log", "level": "error", "message": f"DB init failed: {exc}"})
+    try:
+        purged = db.purge_ephemeral_tasks()
+        if purged:
+            emit({"type": "log", "level": "info", "message": f"Cleared {purged} stale quick-run task(s) from prior session."})
+    except Exception as exc:
+        emit({"type": "log", "level": "error", "message": f"Ephemeral cleanup failed: {exc}"})
 
     emit({"type": "ready", "timestamp": _ts()})
 

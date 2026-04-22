@@ -367,6 +367,8 @@ function registerIpc() {
     ["db:create-task", "db.create_task"],
     ["db:update-task", "db.update_task"],
     ["db:delete-task", "db.delete_task"],
+    ["db:get-inventory", "db.get_inventory"],
+    ["db:delete-inventory-item", "db.delete_inventory_item"],
     ["auth:login-one", "auth.login_one"],
     ["auth:farm", "auth.farm"],
     ["cart:run", "cart.run"],
@@ -399,6 +401,24 @@ function registerIpc() {
     if (canceled || !filePaths?.length) return { ok: false, error: "Cancelled" };
     try {
       const data = await rpc("db.import_file", { file_path: filePaths[0] });
+      return { ok: true, data };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("db:import-tasks-file", async () => {
+    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+      title: "Import tasks CSV/XLSX",
+      properties: ["openFile"],
+      filters: [
+        { name: "Tasks", extensions: ["csv", "xlsx"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (canceled || !filePaths?.length) return { ok: false, error: "Cancelled" };
+    try {
+      const data = await rpc("db.import_tasks_file", { file_path: filePaths[0] });
       return { ok: true, data };
     } catch (err) {
       return { ok: false, error: err.message };

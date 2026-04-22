@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld("api", {
   deleteAccount: (account_id) => ipcRenderer.invoke("db:delete-account", { account_id }),
   assignGroup: (account_ids, group_id) => ipcRenderer.invoke("db:assign-group", { account_ids, group_id }),
   importFile: () => ipcRenderer.invoke("db:import-file"),
+  importTasksFile: () => ipcRenderer.invoke("db:import-tasks-file"),
   getStats: invoke("db:get-stats"),
   getAccountsNeedingAuth: invoke("db:get-accounts-needing-auth"),
   getAccountsWithValidSession: (group_id) =>
@@ -27,6 +28,10 @@ contextBridge.exposeInMainWorld("api", {
   createTask: (fields) => ipcRenderer.invoke("db:create-task", fields),
   updateTask: (task_id, fields) => ipcRenderer.invoke("db:update-task", { task_id, ...fields }),
   deleteTask: (task_id) => ipcRenderer.invoke("db:delete-task", { task_id }),
+
+  // DB — inventory
+  getInventory: invoke("db:get-inventory"),
+  deleteInventoryItem: (item_id) => ipcRenderer.invoke("db:delete-inventory-item", { item_id }),
 
   // Auth / cart / task runners
   authLoginOne: (account) => ipcRenderer.invoke("auth:login-one", { account }),

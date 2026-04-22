@@ -88,8 +88,30 @@ def init_db() -> None:
                 status TEXT DEFAULT 'idle',
                 session_id TEXT DEFAULT '',
                 last_error TEXT DEFAULT '',
+                ephemeral INTEGER DEFAULT 0,
                 updated_at REAL DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS inventory_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                record_key TEXT NOT NULL UNIQUE,
+                purchase_id TEXT DEFAULT '',
+                account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+                account_name TEXT DEFAULT '',
+                account_phone TEXT DEFAULT '',
+                event_url TEXT DEFAULT '',
+                event_name TEXT DEFAULT '',
+                event_date TEXT DEFAULT '',
+                event_venue TEXT DEFAULT '',
+                ticket_type_id TEXT DEFAULT '',
+                ticket_name TEXT DEFAULT '',
+                ticket_currency TEXT DEFAULT 'USD',
+                ticket_price REAL DEFAULT 0,
+                quantity INTEGER DEFAULT 1,
+                total_price REAL DEFAULT 0,
+                purchase_status TEXT DEFAULT 'purchased',
+                purchased_at TEXT DEFAULT (datetime('now'))
             );
 
             INSERT OR IGNORE INTO groups (name) VALUES ('Default');
@@ -105,6 +127,10 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT DEFAULT ''")
             except sqlite3.OperationalError:
                 pass
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN ephemeral INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         conn.close()
 
@@ -269,69 +295,126 @@ def _country(val):
     return _COUNTRY_MAP.get(v, val.strip().upper() if len(val.strip()) == 2 else val.strip()) or "US"
 
 
-def _import_rows(rows: list[dict], group_id: int | None = None) -> int:
-    """Import a list of dicts (from CSV or XLSX). Returns count imported."""
-    count = 0
-    for row in rows:
-        cleaned = {k.strip().lower().replace(" ", "").replace("_", ""): str(v).strip() for k, v in row.items() if v}
+def _account_exists_by_phone(phone: str) -> bool:
+    conn = _connect()
+    row = conn.execute("SELECT 1 FROM accounts WHERE phone = ? LIMIT 1", (phone,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def get_account_by_email(email: str) -> dict | None:
+    """Lookup an account by email (case-insensitive). Returns None if not found."""
+    if not email:
+        return None
+    conn = _connect()
+    row = conn.execute("""
+        SELECT a.*, s.saved_at as session_saved_at
+        FROM accounts a
+        LEFT JOIN sessions s ON s.account_id = a.id
+        WHERE lower(a.email) = lower(?)
+        LIMIT 1
+    """, (email.strip(),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def _import_rows(rows: list[dict], group_id: int | None = None) -> dict:
+    """Import a list of dicts (from CSV or XLSX).
+
+    Returns {'count': N, 'created': C, 'updated': U, 'skipped': S, 'log': [...]}.
+    Each log entry is {'row': int, 'outcome': 'created'|'updated'|'skipped', 'phone': str, 'email': str, 'reason': str}.
+    """
+    log: list[dict] = []
+    created = updated = skipped = 0
+
+    if not rows:
+        return {"count": 0, "created": 0, "updated": 0, "skipped": 0, "log": [
+            {"row": 0, "outcome": "skipped", "phone": "", "email": "", "reason": "file had no data rows"}
+        ]}
+
+    for idx, row in enumerate(rows, start=1):
+        cleaned = {k.strip().lower().replace(" ", "").replace("_", ""): str(v).strip() for k, v in row.items() if v is not None and str(v).strip() != ""}
         phone = _col(cleaned, "phone", "phonenumber")
-        if not phone:
-            continue
         email = _col(cleaned, "email", "diceemail", "billingemail")
-        add_account(
-            name=_col(cleaned, "profilename", "profile", "account") or email.split("@")[0] or phone,
-            phone=phone, email=email,
-            card_number=_col(cleaned, "cardnumber", "card"),
-            card_exp_month=_col(cleaned, "cardexpmonth", "expmonth"),
-            card_exp_year=_col(cleaned, "cardexpyear", "expyear"),
-            card_cvv=_col(cleaned, "cvv", "cvc"),
-            billing_name=_col(cleaned, "billingname", "name", "fullname"),
-            billing_email=_col(cleaned, "billingemail") or email,
-            billing_phone=_col(cleaned, "billingphone") or phone,
-            billing_postal=_col(
-                cleaned,
-                "billingpostal",
-                "billingpostalcode",
-                "billingzip",
-                "postal",
-                "zip",
-                "zipcode",
-                "postalcode",
-            ),
-            billing_country=_country(_col(cleaned, "country", "billingcountry") or "US"),
-            proxy=_col(cleaned, "proxy"),
-            aycd_key=_col(cleaned, "aycdkey", "aycd", "aycdapikey"),
-            aycd_email=_col(cleaned, "aycdemail", "aycdmail", "aycdlookupemail"),
-            imap_email=_col(cleaned, "imapemail", "imapuser", "imapusername", "imaplogin"),
-            imap_password=_col(cleaned, "imappassword", "imappass", "imapapppassword", "imaptoken"),
-            imap_host=_col(cleaned, "imaphost", "imapserver"),
-            group_id=group_id,
-        )
-        count += 1
-    return count
+
+        if not phone:
+            skipped += 1
+            log.append({
+                "row": idx, "outcome": "skipped", "phone": "", "email": email,
+                "reason": f"no phone column (saw headers: {', '.join(sorted(cleaned.keys())) or 'none'})"
+            })
+            continue
+
+        try:
+            was_existing = _account_exists_by_phone(phone)
+            add_account(
+                name=_col(cleaned, "profilename", "profile", "account") or (email.split("@")[0] if email else "") or phone,
+                phone=phone, email=email,
+                card_number=_col(cleaned, "cardnumber", "card"),
+                card_exp_month=_col(cleaned, "cardexpmonth", "expmonth"),
+                card_exp_year=_col(cleaned, "cardexpyear", "expyear"),
+                card_cvv=_col(cleaned, "cvv", "cvc"),
+                billing_name=_col(cleaned, "billingname", "name", "fullname"),
+                billing_email=_col(cleaned, "billingemail") or email,
+                billing_phone=_col(cleaned, "billingphone") or phone,
+                billing_postal=_col(
+                    cleaned,
+                    "billingpostal",
+                    "billingpostalcode",
+                    "billingzip",
+                    "postal",
+                    "zip",
+                    "zipcode",
+                    "postalcode",
+                ),
+                billing_country=_country(_col(cleaned, "country", "billingcountry") or "US"),
+                proxy=_col(cleaned, "proxy"),
+                aycd_key=_col(cleaned, "aycdkey", "aycd", "aycdapikey"),
+                aycd_email=_col(cleaned, "aycdemail", "aycdmail", "aycdlookupemail"),
+                imap_email=_col(cleaned, "imapemail", "imapuser", "imapusername", "imaplogin"),
+                imap_password=_col(cleaned, "imappassword", "imappass", "imapapppassword", "imaptoken"),
+                imap_host=_col(cleaned, "imaphost", "imapserver"),
+                group_id=group_id,
+            )
+        except Exception as exc:
+            skipped += 1
+            log.append({
+                "row": idx, "outcome": "skipped", "phone": phone, "email": email,
+                "reason": f"db error: {exc}"
+            })
+            continue
+
+        if was_existing:
+            updated += 1
+            log.append({"row": idx, "outcome": "updated", "phone": phone, "email": email, "reason": "existing phone — row replaced"})
+        else:
+            created += 1
+            log.append({"row": idx, "outcome": "created", "phone": phone, "email": email, "reason": ""})
+
+    return {"count": created + updated, "created": created, "updated": updated, "skipped": skipped, "log": log}
 
 
-def import_file(file_path: str, group_id: int | None = None) -> int:
-    """Import accounts from CSV or XLSX. Returns count imported."""
+def import_file(file_path: str, group_id: int | None = None) -> dict:
+    """Import accounts from CSV or XLSX. Returns {count, created, updated, skipped, log}."""
     ext = os.path.splitext(file_path)[1].lower()
-
     if ext in (".xlsx", ".xls"):
-        return _import_xlsx(file_path, group_id)
+        rows = _read_xlsx_rows(file_path)
     else:
-        return _import_csv(file_path, group_id)
+        rows = _read_csv_rows(file_path)
+    return _import_rows(rows, group_id)
 
 
-def _import_csv(csv_path: str, group_id: int | None = None) -> int:
+def _read_csv_rows(csv_path: str) -> list[dict]:
     import csv as csv_mod
     rows = []
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv_mod.DictReader(f)
         for row in reader:
             rows.append(row)
-    return _import_rows(rows, group_id)
+    return rows
 
 
-def _import_xlsx(xlsx_path: str, group_id: int | None = None) -> int:
+def _read_xlsx_rows(xlsx_path: str) -> list[dict]:
     from openpyxl import load_workbook
     wb = load_workbook(xlsx_path, read_only=True, data_only=True)
     ws = wb.active
@@ -346,11 +429,101 @@ def _import_xlsx(xlsx_path: str, group_id: int | None = None) -> int:
         if any(row.values()):
             rows.append(row)
     wb.close()
-    return _import_rows(rows, group_id)
+    return rows
 
 
-# Keep old name as alias
+# Keep old names as aliases
 import_csv = import_file
+_import_csv = _read_csv_rows
+_import_xlsx = _read_xlsx_rows
+
+
+# ── Task CSV import ───────────────────────────────────────────────────────
+
+def _num(v):
+    if v in ("", None):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def import_tasks_file(file_path: str) -> dict:
+    """Import tasks from CSV/XLSX.
+
+    Expected columns: email, eventURL, min_price, max_price, qty, code.
+    For each row: look up the account by email, require a warm session, then create a task.
+    Returns {'count', 'created', 'skipped', 'log': [{row, outcome, email, event_url, reason}]}.
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in (".xlsx", ".xls"):
+        rows = _read_xlsx_rows(file_path)
+    else:
+        rows = _read_csv_rows(file_path)
+
+    log: list[dict] = []
+    created = skipped = 0
+
+    if not rows:
+        return {"count": 0, "created": 0, "skipped": 0, "log": [
+            {"row": 0, "outcome": "skipped", "email": "", "event_url": "", "reason": "file had no data rows"}
+        ]}
+
+    for idx, row in enumerate(rows, start=1):
+        cleaned = {k.strip().lower().replace(" ", "").replace("_", ""): str(v).strip() for k, v in row.items() if v is not None and str(v).strip() != ""}
+
+        email = _col(cleaned, "email", "diceemail", "accountemail")
+        event_url = _col(cleaned, "eventurl", "event", "url")
+
+        if not email:
+            skipped += 1
+            log.append({"row": idx, "outcome": "skipped", "email": "", "event_url": event_url, "reason": "row has no email"})
+            continue
+        if not event_url:
+            skipped += 1
+            log.append({"row": idx, "outcome": "skipped", "email": email, "event_url": "", "reason": "row has no eventURL"})
+            continue
+
+        account = get_account_by_email(email)
+        if not account:
+            skipped += 1
+            log.append({"row": idx, "outcome": "skipped", "email": email, "event_url": event_url, "reason": "no account matches this email"})
+            continue
+
+        saved_at = account.get("session_saved_at")
+        if not saved_at or (time.time() - saved_at) >= SESSION_MAX_AGE:
+            skipped += 1
+            reason = "account has no session — run auth farm first" if not saved_at else "session expired — re-run auth"
+            log.append({"row": idx, "outcome": "skipped", "email": email, "event_url": event_url, "reason": reason})
+            continue
+
+        try:
+            qty_raw = _col(cleaned, "qty", "quantity")
+            qty = int(qty_raw) if qty_raw else 1
+        except ValueError:
+            qty = 1
+
+        try:
+            create_task(
+                account_id=int(account["id"]),
+                event_url=event_url,
+                min_price=_num(_col(cleaned, "minprice", "min")),
+                max_price=_num(_col(cleaned, "maxprice", "max")),
+                presale_code=_col(cleaned, "code", "presalecode", "accesscode"),
+                ticket_tier=_col(cleaned, "tier", "tickettier"),
+                quantity=qty,
+                mode=_col(cleaned, "mode") or "auto",
+            )
+        except Exception as exc:
+            skipped += 1
+            log.append({"row": idx, "outcome": "skipped", "email": email, "event_url": event_url, "reason": f"db error: {exc}"})
+            continue
+
+        created += 1
+        log.append({"row": idx, "outcome": "created", "email": email, "event_url": event_url, "reason": ""})
+
+    return {"count": created, "created": created, "skipped": skipped, "log": log}
 
 
 # ── Sessions ──────────────────────────────────────────────────────────────
@@ -446,10 +619,11 @@ def get_accounts_with_valid_session(group_id: int | None = None) -> list[dict]:
 
 # ── Tasks ─────────────────────────────────────────────────────────────────
 
-_TASK_FIELDS = {"event_url","min_price","max_price","presale_code","ticket_tier","quantity","mode","scheduled_at","scheduled_tz"}
+_TASK_FIELDS = {"event_url","min_price","max_price","presale_code","ticket_tier","quantity","mode","scheduled_at","scheduled_tz","ephemeral"}
 
 
 def get_tasks() -> list[dict]:
+    """Persistent (non-ephemeral) tasks only — what the Tasks page shows."""
     conn = _connect()
     rows = conn.execute("""
         SELECT t.*, a.phone as account_phone, a.email as account_email,
@@ -459,10 +633,23 @@ def get_tasks() -> list[dict]:
         INNER JOIN accounts a ON a.id = t.account_id
         LEFT JOIN groups g ON a.group_id = g.id
         LEFT JOIN sessions s ON s.account_id = a.id
+        WHERE COALESCE(t.ephemeral, 0) = 0
         ORDER BY t.id DESC
     """).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def purge_ephemeral_tasks() -> int:
+    """Delete every ephemeral task row. Call on worker boot so stale quick-runs
+    from a prior crash don't linger."""
+    with _lock:
+        conn = _connect()
+        cur = conn.execute("DELETE FROM tasks WHERE COALESCE(ephemeral, 0) = 1")
+        conn.commit()
+        n = cur.rowcount
+        conn.close()
+        return n
 
 
 def get_task(task_id: int) -> dict | None:
@@ -484,8 +671,8 @@ def create_task(account_id: int, **fields) -> int:
         cur = conn.execute("""
             INSERT INTO tasks
             (account_id, event_url, min_price, max_price, presale_code, ticket_tier,
-             quantity, mode, scheduled_at, scheduled_tz, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             quantity, mode, scheduled_at, scheduled_tz, ephemeral, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             account_id,
             clean.get("event_url") or "",
@@ -497,6 +684,7 @@ def create_task(account_id: int, **fields) -> int:
             clean.get("mode") or "auto",
             clean.get("scheduled_at") or "",
             clean.get("scheduled_tz") or "",
+            1 if clean.get("ephemeral") else 0,
             time.time(),
         ))
         conn.commit()
@@ -573,3 +761,96 @@ def get_stats() -> dict:
         "no_session": total - with_session,
         "groups": groups,
     }
+
+
+# ── Inventory ─────────────────────────────────────────────────────────────
+
+def get_inventory_items() -> list[dict]:
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT * FROM inventory_items ORDER BY purchased_at DESC, id DESC
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_inventory_item(item_id: int) -> None:
+    with _lock:
+        conn = _connect()
+        conn.execute("DELETE FROM inventory_items WHERE id = ?", (item_id,))
+        conn.commit()
+        conn.close()
+
+
+def record_inventory_purchase(
+    record_key: str,
+    purchase_id: str = "",
+    account_id: int | None = None,
+    account_name: str = "",
+    account_phone: str = "",
+    event_url: str = "",
+    event_name: str = "",
+    event_date: str = "",
+    event_venue: str = "",
+    ticket_type_id: str = "",
+    ticket_name: str = "",
+    ticket_currency: str = "USD",
+    ticket_price: float | None = None,
+    quantity: int = 1,
+    total_price: float | None = None,
+    purchase_status: str = "purchased",
+    purchased_at: str | None = None,
+) -> None:
+    qty = max(1, int(quantity or 1))
+    unit_price = float(ticket_price or 0)
+    total = float(total_price) if total_price is not None else (unit_price * qty)
+    stamp = purchased_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    with _lock:
+        conn = _connect()
+        conn.execute("""
+            INSERT INTO inventory_items (
+                record_key, purchase_id, account_id, account_name, account_phone,
+                event_url, event_name, event_date, event_venue,
+                ticket_type_id, ticket_name, ticket_currency, ticket_price,
+                quantity, total_price, purchase_status, purchased_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(record_key) DO UPDATE SET
+                purchase_id = excluded.purchase_id,
+                account_id = excluded.account_id,
+                account_name = excluded.account_name,
+                account_phone = excluded.account_phone,
+                event_url = excluded.event_url,
+                event_name = excluded.event_name,
+                event_date = excluded.event_date,
+                event_venue = excluded.event_venue,
+                ticket_type_id = excluded.ticket_type_id,
+                ticket_name = excluded.ticket_name,
+                ticket_currency = excluded.ticket_currency,
+                ticket_price = excluded.ticket_price,
+                quantity = excluded.quantity,
+                total_price = excluded.total_price,
+                purchase_status = excluded.purchase_status,
+                purchased_at = excluded.purchased_at
+        """, (
+            record_key.strip(),
+            (purchase_id or "").strip(),
+            int(account_id) if account_id else None,
+            (account_name or "").strip(),
+            (account_phone or "").strip(),
+            (event_url or "").strip(),
+            (event_name or "").strip(),
+            (event_date or "").strip(),
+            (event_venue or "").strip(),
+            (ticket_type_id or "").strip(),
+            (ticket_name or "").strip(),
+            (ticket_currency or "USD").strip().upper(),
+            unit_price,
+            qty,
+            total,
+            (purchase_status or "purchased").strip(),
+            stamp,
+        ))
+        conn.commit()
+        conn.close()

@@ -13,6 +13,8 @@ const state = {
   tasks: [],
   selectedTasks: new Set(),
   taskSearch: "",
+  inventory: [],
+  inventorySearch: "",
   authFarm: { sessionId: null, running: false, accountStatus: new Map() },
   update: null,
   settings: loadSettings(),
@@ -129,6 +131,7 @@ function gotoPage(page) {
   if (page === "auth") refreshAuthFarm();
   if (page === "dashboard") refreshDashboard();
   if (page === "tasks") refreshTasks();
+  if (page === "inventory") refreshInventory();
 }
 
 $("#gotoGuideBtn")?.addEventListener("click", () => gotoPage("guide"));
@@ -410,9 +413,52 @@ async function openBulkAssignModal() {
 $("#addAccountBtn").addEventListener("click", () => openAccountModal(null));
 $("#importBtn").addEventListener("click", async () => {
   const r = await api.importFile();
-  if (r.ok) { alert(`Imported ${r.data.count} accounts.`); refreshAccounts(); }
-  else if (r.error !== "Cancelled") alert("Import failed: " + r.error);
+  if (r.ok) {
+    showImportResultModal({
+      title: "Account import result",
+      summary: [
+        `Created: ${r.data.created}`,
+        `Updated: ${r.data.updated}`,
+        `Skipped: ${r.data.skipped}`,
+      ],
+      log: r.data.log || [],
+      columns: ["row", "outcome", "phone", "email", "reason"],
+    });
+    refreshAccounts();
+  } else if (r.error !== "Cancelled") {
+    alert("Import failed: " + r.error);
+  }
 });
+
+function showImportResultModal({ title, summary, log, columns }) {
+  const rows = (log || []).map((e) => {
+    const cells = columns.map((c) => `<td>${escapeHtml(String(e[c] ?? ""))}</td>`).join("");
+    return `<tr class="import-log-${escapeHtml(e.outcome || "")}">${cells}</tr>`;
+  }).join("");
+  const head = columns.map((c) => `<th>${escapeHtml(c)}</th>`).join("");
+  const summaryHtml = summary.map((s) => `<span class="pill">${escapeHtml(s)}</span>`).join(" ");
+  openModal({
+    title,
+    bodyHtml: `
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">${summaryHtml}</div>
+      <div style="max-height:400px; overflow:auto; border:1px solid var(--border); border-radius:8px;">
+        <table style="width:100%; border-collapse:collapse; font-size:12px;">
+          <thead style="position:sticky; top:0; background:var(--bg-1);">
+            <tr>${head}</tr>
+          </thead>
+          <tbody>${rows || `<tr><td colspan="${columns.length}" style="padding:12px; text-align:center; color:var(--text-muted);">No rows processed.</td></tr>`}</tbody>
+        </table>
+      </div>
+      <style>
+        .import-log-created td { color: var(--text); }
+        .import-log-updated td { color: var(--text-muted); }
+        .import-log-skipped td { color: #ff9a9a; }
+        #modalBody table th, #modalBody table td { padding:6px 10px; border-bottom:1px solid var(--border); text-align:left; }
+      </style>
+    `,
+    footerHtml: `<button class="btn btn-primary" data-close>Close</button>`,
+  });
+}
 $("#showSampleBtn").addEventListener("click", showSampleModal);
 
 function showSampleModal() {
@@ -889,6 +935,23 @@ async function stopTasks(ids) {
 
 $("#addTaskBtn").addEventListener("click", () => openTaskModal(null));
 $("#refreshTasksBtn").addEventListener("click", refreshTasks);
+$("#importTasksBtn").addEventListener("click", async () => {
+  const r = await api.importTasksFile();
+  if (r.ok) {
+    showImportResultModal({
+      title: "Task import result",
+      summary: [
+        `Created: ${r.data.created}`,
+        `Skipped: ${r.data.skipped}`,
+      ],
+      log: r.data.log || [],
+      columns: ["row", "outcome", "email", "event_url", "reason"],
+    });
+    refreshTasks();
+  } else if (r.error !== "Cancelled") {
+    alert("Import failed: " + r.error);
+  }
+});
 $("#taskSearch").addEventListener("input", (e) => { state.taskSearch = e.target.value; renderTasks(); });
 
 $("#selectAllTasks").addEventListener("change", (e) => {
@@ -1064,6 +1127,82 @@ function openBulkEditTasksModal() {
   });
 }
 
+// ── Inventory page ────────────────────────────────────────────────────────
+async function refreshInventory() {
+  const r = await api.getInventory();
+  state.inventory = r.ok ? (r.data || []) : [];
+  renderInventory();
+}
+
+function renderInventory() {
+  const body = $("#inventoryBody");
+  const summary = $("#inventorySummary");
+  const search = (state.inventorySearch || "").toLowerCase();
+  const rows = state.inventory.filter((it) => {
+    if (!search) return true;
+    return (it.event_name || "").toLowerCase().includes(search)
+        || (it.ticket_name || "").toLowerCase().includes(search)
+        || (it.account_phone || "").toLowerCase().includes(search)
+        || (it.account_name || "").toLowerCase().includes(search)
+        || (it.purchase_id || "").toLowerCase().includes(search);
+  });
+
+  const totalTickets = rows.reduce((n, it) => n + (parseInt(it.quantity, 10) || 1), 0);
+  const totalSpendByCcy = {};
+  for (const it of rows) {
+    const ccy = (it.ticket_currency || "USD").toUpperCase();
+    totalSpendByCcy[ccy] = (totalSpendByCcy[ccy] || 0) + (parseFloat(it.total_price) || 0);
+  }
+  const spendBits = Object.entries(totalSpendByCcy)
+    .map(([ccy, amt]) => `${priceSymbol(ccy)}${amt.toFixed(2)}`)
+    .join(" · ");
+  summary.textContent = rows.length
+    ? `${rows.length} purchase(s) · ${totalTickets} ticket(s)${spendBits ? " · " + spendBits : ""}`
+    : "No tickets yet.";
+
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="9" style="padding:20px; text-align:center; color:var(--text-muted);">${state.inventory.length ? "No matches." : "No tickets yet."}</td></tr>`;
+    return;
+  }
+
+  body.innerHTML = rows.map((it) => {
+    const purchased = (it.purchased_at || "").replace("T", " ").replace(/\.\d+Z?$/, "");
+    const price = `${priceSymbol(it.ticket_currency)}${Number(it.total_price || 0).toFixed(2)}`;
+    const unit = Number.isFinite(parseFloat(it.ticket_price)) && parseFloat(it.ticket_price) > 0
+      ? ` <span class="muted">(${priceSymbol(it.ticket_currency)}${Number(it.ticket_price).toFixed(2)} ea)</span>` : "";
+    const date = [it.event_date, it.event_venue].filter(Boolean).join(" · ");
+    return `<tr data-inv-id="${it.id}">
+      <td>${escapeHtml(purchased)}</td>
+      <td>${escapeHtml(it.event_name || "—")}</td>
+      <td>${escapeHtml(date || "—")}</td>
+      <td>${escapeHtml(it.ticket_name || "—")}</td>
+      <td>${escapeHtml(String(it.quantity || 1))}</td>
+      <td>${price}${unit}</td>
+      <td>${escapeHtml(it.account_phone || it.account_name || "—")}</td>
+      <td><code style="font-size:11px;">${escapeHtml(it.purchase_id || "—")}</code></td>
+      <td><button class="btn btn-ghost btn-sm" data-inv-action="delete">Remove</button></td>
+    </tr>`;
+  }).join("");
+
+  body.querySelectorAll('[data-inv-action="delete"]').forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      const tr = e.target.closest("tr");
+      const id = parseInt(tr?.dataset.invId || "", 10);
+      if (!id) return;
+      if (!confirm("Remove this inventory row?")) return;
+      const r = await api.deleteInventoryItem(id);
+      if (r.ok) refreshInventory();
+      else alert("Delete failed: " + r.error);
+    });
+  });
+}
+
+$("#refreshInventoryBtn").addEventListener("click", refreshInventory);
+$("#inventorySearch").addEventListener("input", (e) => {
+  state.inventorySearch = e.target.value;
+  renderInventory();
+});
+
 // ── Modal helpers ─────────────────────────────────────────────────────────
 const modalBackdrop = $("#modalBackdrop");
 function openModal({ title, bodyHtml, footerHtml, onMount }) {
@@ -1100,6 +1239,10 @@ api.onEvent((msg) => {
   }
   if (msg.type === "task_update") {
     if ($("#page-tasks").classList.contains("active")) refreshTasks();
+    return;
+  }
+  if (msg.type === "inventory_update") {
+    if ($("#page-inventory").classList.contains("active")) refreshInventory();
     return;
   }
   if (msg.type === "cart_update") {

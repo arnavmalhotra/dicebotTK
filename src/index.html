@@ -19,6 +19,7 @@
         <button class="nav-btn" data-page="accounts">Accounts</button>
         <button class="nav-btn" data-page="auth">Auth Farm</button>
         <button class="nav-btn" data-page="tasks">Tasks</button>
+        <button class="nav-btn" data-page="inventory">Inventory</button>
         <button class="nav-btn" data-page="guide">Guide</button>
         <button class="nav-btn" data-page="settings">Settings</button>
       </nav>
@@ -152,6 +153,7 @@
           </div>
           <div class="page-actions">
             <button class="btn btn-ghost" id="refreshTasksBtn">Refresh</button>
+            <button class="btn btn-ghost" id="importTasksBtn">Import CSV</button>
             <button class="btn btn-primary" id="addTaskBtn">Add task</button>
           </div>
         </div>
@@ -180,6 +182,49 @@
 
         <div id="taskGrid" class="task-grid">
           <div class="empty-state">No tasks yet. Click "Add task" to create one.</div>
+        </div>
+      </section>
+
+      <!-- ── Inventory ─────────────────────────────────────────────── -->
+      <section class="page" id="page-inventory">
+        <div class="page-header">
+          <div>
+            <h2>Inventory</h2>
+            <p class="muted">Tickets successfully purchased across every task and quick-run.</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-ghost" id="refreshInventoryBtn">Refresh</button>
+          </div>
+        </div>
+
+        <div class="accounts-toolbar">
+          <div style="display:flex; align-items:center; gap:12px; font-size:13px; color:var(--text-muted);">
+            <span id="inventorySummary">—</span>
+          </div>
+          <div class="toolbar-right">
+            <input type="text" id="inventorySearch" placeholder="Search event, account, ticket…" />
+          </div>
+        </div>
+
+        <div id="inventoryTableWrap" style="border:1px solid var(--border); border-radius:8px; overflow:auto; max-height:calc(100vh - 240px);">
+          <table id="inventoryTable" style="width:100%; border-collapse:collapse; font-size:12px;">
+            <thead style="position:sticky; top:0; background:var(--bg-1); z-index:1;">
+              <tr>
+                <th>Purchased</th>
+                <th>Event</th>
+                <th>Date / Venue</th>
+                <th>Ticket</th>
+                <th>Qty</th>
+                <th>Total</th>
+                <th>Account</th>
+                <th>Purchase ID</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="inventoryBody">
+              <tr><td colspan="9" style="padding:20px; text-align:center; color:var(--text-muted);">No tickets yet.</td></tr>
+            </tbody>
+          </table>
         </div>
       </section>
 
