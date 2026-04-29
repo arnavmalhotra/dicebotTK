@@ -406,12 +406,16 @@ def import_file(file_path: str, group_id: int | None = None) -> dict:
 
 def _read_csv_rows(csv_path: str) -> list[dict]:
     import csv as csv_mod
-    rows = []
-    with open(csv_path, newline="", encoding="utf-8-sig") as f:
-        reader = csv_mod.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    return rows
+    # Excel on Windows saves "CSV (Comma delimited)" as cp1252, not UTF-8.
+    # latin-1 is byte-identity so the final fallback always succeeds.
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            with open(csv_path, newline="", encoding=encoding) as f:
+                reader = csv_mod.DictReader(f)
+                return [row for row in reader]
+        except UnicodeDecodeError:
+            continue
+    return []
 
 
 def _read_xlsx_rows(xlsx_path: str) -> list[dict]:
