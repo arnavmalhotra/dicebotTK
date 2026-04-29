@@ -1289,5 +1289,9 @@ setInterval(() => {
 }, 500);
 
 // ── Init ──────────────────────────────────────────────────────────────────
+api.getAppVersion().then((version) => {
+  const tag = $("#versionTag");
+  if (tag && version) tag.textContent = `v${String(version).replace(/^v/i, "")}`;
+});
 hydrateSettingsForm();
 refreshDashboard();

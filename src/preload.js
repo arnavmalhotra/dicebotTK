@@ -46,6 +46,7 @@ contextBridge.exposeInMainWorld("api", {
   // Shell helpers
   openExternal: (url) => ipcRenderer.invoke("shell:open-external", url),
   saveSample: invoke("dialog:save-sample"),
+  getAppVersion: invoke("app:get-version"),
   getUpdateState: invoke("update:get-state"),
   installUpdate: invoke("update:install"),
 

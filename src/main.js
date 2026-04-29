@@ -455,6 +455,8 @@ function registerIpc() {
     return { ok: true, filePath };
   });
 
+  ipcMain.handle("app:get-version", async () => app.getVersion());
+
   ipcMain.handle("update:get-state", async () => ({ ...updateState }));
   ipcMain.handle("update:install", async () => {
     try {

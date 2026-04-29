@@ -91,6 +91,8 @@ body {
 }
 
 .nav-right { display: flex; align-items: center; gap: 8px; }
+.version-tag { font-size: 10px; color: var(--text-muted); letter-spacing: 0.02em; }
+.version-tag:empty { display: none; }
 .badge {
   padding: 6px 12px;
   border-radius: 999px;
