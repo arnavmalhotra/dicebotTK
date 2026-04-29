@@ -246,8 +246,14 @@ function resolveWorker() {
 
 function startPython() {
   const spec = resolveWorker();
+  // In packaged builds __dirname lives inside app.asar — joining ".." gives a
+  // virtual path that doesn't exist on disk, which Windows rejects as cwd.
+  // Use the worker's own real directory under resourcesPath instead.
+  const cwd = app.isPackaged
+    ? path.dirname(spec.command)
+    : path.join(__dirname, "..");
   pyProc = spawn(spec.command, spec.args, {
-    cwd: path.join(__dirname, ".."),
+    cwd,
     env: { ...process.env, PYTHONUTF8: "1", PYTHONUNBUFFERED: "1" },
     stdio: ["pipe", "pipe", "pipe"],
   });
