@@ -364,6 +364,13 @@ function createWindow() {
     Menu.setApplicationMenu(null);
   }
   mainWindow.loadFile(path.join(__dirname, "index.html"));
+  if (!app.isPackaged) {
+    mainWindow.webContents.openDevTools({ mode: "detach" });
+    mainWindow.webContents.on("console-message", (e) => {
+      const detail = e?.message ?? e;
+      console.error(`[renderer:${e?.level ?? "log"}] ${detail}${e?.sourceId ? ` (${e.sourceId}:${e.lineNumber})` : ""}`);
+    });
+  }
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown") return;
     const key = input.key;

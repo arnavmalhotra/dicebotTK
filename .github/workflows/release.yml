@@ -188,6 +188,48 @@ jobs:
           EOF
           aws --endpoint-url "${endpoint}" s3 cp update-manifest.json "s3://${R2_BUCKET}/latest/DiceBotTicketKings-update.json" --content-type application/json
 
+      - name: Prune old R2 releases
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: "true"
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          KEEP_RELEASES: ${{ vars.KEEP_RELEASES || '3' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          prefix="ticketkings-releases/"
+          keep="${KEEP_RELEASES}"
+
+          mapfile -t tags < <(
+            aws --endpoint-url "${endpoint}" s3api list-objects-v2 \
+              --bucket "${R2_BUCKET}" \
+              --prefix "${prefix}" \
+              --delimiter "/" \
+              --query 'CommonPrefixes[].Prefix' \
+              --output text 2>/dev/null \
+              | tr '\t' '\n' \
+              | sed -e "s|^${prefix}||" -e 's|/$||' \
+              | grep -v '^$' \
+              | sort -V -r
+          )
+
+          if [ "${#tags[@]}" -le "${keep}" ]; then
+            echo "Only ${#tags[@]} releases in R2; keeping all."
+            exit 0
+          fi
+
+          echo "Found ${#tags[@]} releases. Keeping latest ${keep}:"
+          printf '  keep: %s\n' "${tags[@]:0:${keep}}"
+          echo "Deleting older releases:"
+          for old in "${tags[@]:${keep}}"; do
+            echo "  - ${old}"
+            aws --endpoint-url "${endpoint}" s3 rm "s3://${R2_BUCKET}/${prefix}${old}/" --recursive
+          done
+
       - name: Write download summary
         env:
           R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}

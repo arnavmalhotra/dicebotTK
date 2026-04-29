@@ -1,8 +1,10 @@
+setuptools
 curl_cffi>=0.7
 requests
 pytz
 tzdata
 2captcha-python
+python3-capsolver
 openpyxl
 undetected-chromedriver
 selenium

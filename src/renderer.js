@@ -1719,6 +1719,96 @@ function exportCartEvents(sessionId, format = "csv") {
   ];
   downloadFile(`${stem}-events.csv`, toCsv(events, cols), "text/csv");
 }
+// ── Cart helpers ──────────────────────────────────────────────────────────
+function tierPriceLabel(tier) {
+  return `${priceSymbol(tier.currency)}${(Number(tier.price_cents || 0) / 100).toFixed(2)}`;
+}
+
+function tierIsActionable(tier) {
+  const status = String(tier?.status || "").toLowerCase();
+  const secondary = String(tier?.secondary_status || "").toLowerCase();
+  // Dice frequently leaves status="on-sale" while flagging sold-out via
+  // secondary_status. Block on either field reporting a non-purchasable state.
+  const blocked = new Set([
+    "sold-out", "soldout",
+    "off-sale", "offsale",
+    "not-on-sale",
+    "ended", "expired", "closed",
+    "unavailable",
+    "waitlist",
+  ]);
+  if (blocked.has(status) || blocked.has(secondary)) return false;
+  return status === "on-sale" || Boolean(tier?.has_reserve_token);
+}
+
+function formatTierBadges(tier) {
+  const badges = [];
+  if (tier.status) badges.push(`<span class="tier-badge">${escapeHtml(tier.status)}</span>`);
+  if (tier.secondary_status) badges.push(`<span class="tier-badge">${escapeHtml(tier.secondary_status)}</span>`);
+  if (tier.price_tier_name) badges.push(`<span class="tier-badge">${escapeHtml(tier.price_tier_name)}</span>`);
+  if (tier.price_tier_index != null) badges.push(`<span class="tier-badge">Tier ${escapeHtml(String(tier.price_tier_index))}</span>`);
+  if (tier.has_reserve_token) badges.push('<span class="tier-badge">Reserve token ready</span>');
+  return badges.join("");
+}
+
+async function launchCartRuns(accounts, common, options = {}) {
+  const { perProfileCodes = null } = options;
+  const failures = [];
+  const splitMode = String(common.fire_mode || "").toLowerCase() === "split";
+  const splitCutoff = splitMode ? Math.floor(accounts.length / 2) : 0;
+  await Promise.all(accounts.map(async (account, idx) => {
+    const perTask = { ...common, account };
+    if (splitMode) {
+      perTask.pre_drop_fire_window_enabled = idx < splitCutoff;
+    }
+    if (perProfileCodes) {
+      const code = perProfileCodes.get(account.id);
+      perTask.presale_code = code || "";
+    }
+    const res = await api.cartRun(perTask);
+    if (res.ok) {
+      state.carts.set(res.data.session_id, {
+        session_id: res.data.session_id,
+        account_phone: account.phone,
+        account_id: account.id,
+        status: "starting",
+      });
+    } else {
+      failures.push(`${account.phone}: ${res.error}`);
+    }
+  }));
+  renderCartGrid();
+  return { failures };
+}
+
+function normalizeDiceEventInput(value) {
+  const raw = String(value || "").trim().replace(/\s+/g, "").replace(/[,\s]+$/g, "");
+  if (!raw) return "";
+  if (/^[a-f0-9]{24}$/i.test(raw)) return `https://dice.fm/event/${raw.toLowerCase()}`;
+  if (!raw.includes("/") && !raw.includes(".")) return `https://dice.fm/event/${raw}`;
+  const withScheme = raw.startsWith("//")
+    ? `https:${raw}`
+    : (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+  try {
+    const url = new URL(withScheme);
+    const parts = url.pathname.split("/").filter(Boolean);
+    let slug = "";
+    for (let i = 0; i < parts.length; i += 1) {
+      if ((parts[i] === "event" || parts[i] === "events") && parts[i + 1]) {
+        slug = parts[i + 1];
+        break;
+      }
+    }
+    if (!slug && parts.length && !["event", "events"].includes(parts[parts.length - 1])) {
+      slug = parts[parts.length - 1];
+    }
+    return slug ? `https://dice.fm/event/${slug}` : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+
 
 // ── Dashboard / carts ─────────────────────────────────────────────────────
 async function refreshDashboard() {
