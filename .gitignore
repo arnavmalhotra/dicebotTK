@@ -32,6 +32,7 @@ bright_debug.png
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 .DS_Store
 Thumbs.db
