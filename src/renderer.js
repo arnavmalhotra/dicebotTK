@@ -651,6 +651,86 @@ function appendFarmLog(message, level = "info") {
   pane.scrollTop = pane.scrollHeight;
 }
 
+function readLogPaneText(pane) {
+  if (!pane) return "";
+  return [...pane.querySelectorAll(".log-line")]
+    .map((line) => {
+      const ts = line.querySelector(".log-ts")?.textContent.trim() || "";
+      const tsNode = line.querySelector(".log-ts");
+      const msg = ((tsNode ? line.textContent.slice(ts.length) : line.textContent) || "").trim();
+      return ts ? `${ts}  ${msg}` : msg;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function cartLogsAsText(cart) {
+  return (cart?.logs || [])
+    .map((l) => `${l.ts || ""} ${(l.level || "info").toUpperCase()}  ${l.msg || ""}`.trim())
+    .join("\n");
+}
+
+async function copyTextToClipboard(text, button) {
+  try {
+    await navigator.clipboard.writeText(text);
+    if (button) flashButton(button, "Copied");
+  } catch {
+    if (button) flashButton(button, "Copy failed", true);
+  }
+}
+
+function downloadTextFile(text, filename) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function flashButton(btn, text, isError = false) {
+  const original = btn.textContent;
+  btn.textContent = text;
+  btn.classList.toggle("btn-danger", isError);
+  setTimeout(() => {
+    btn.textContent = original;
+    btn.classList.remove("btn-danger");
+  }, 1200);
+}
+
+function timestampForFile() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+const farmLogCopyBtn = $("#farmLogCopy");
+if (farmLogCopyBtn) {
+  farmLogCopyBtn.addEventListener("click", () => {
+    const text = readLogPaneText($("#farmLog"));
+    if (!text) return flashButton(farmLogCopyBtn, "Empty");
+    copyTextToClipboard(text, farmLogCopyBtn);
+  });
+}
+const farmLogExportBtn = $("#farmLogExport");
+if (farmLogExportBtn) {
+  farmLogExportBtn.addEventListener("click", () => {
+    const text = readLogPaneText($("#farmLog"));
+    if (!text) return flashButton(farmLogExportBtn, "Empty");
+    downloadTextFile(text, `auth-farm-log-${timestampForFile()}.txt`);
+  });
+}
+const farmLogClearBtn = $("#farmLogClear");
+if (farmLogClearBtn) {
+  farmLogClearBtn.addEventListener("click", () => {
+    const pane = $("#farmLog");
+    if (pane) pane.innerHTML = "";
+  });
+}
+
 // ── Dashboard / carts ─────────────────────────────────────────────────────
 async function refreshDashboard() {
   const stats = await api.getStats();
@@ -698,6 +778,8 @@ function renderCartCard(cart) {
     <div class="cart-countdown" data-countdown="${cart.ttl_until || 0}">--:--</div>
     <div class="cart-actions">
       <button class="btn btn-ghost btn-sm" data-cart-action="logs">Logs</button>
+      <button class="btn btn-ghost btn-sm" data-cart-action="copy-logs">Copy</button>
+      <button class="btn btn-ghost btn-sm" data-cart-action="export-logs">Export</button>
       <button class="btn btn-ghost btn-sm" data-cart-action="decline">Decline</button>
       <button class="btn btn-primary btn-sm" data-cart-action="approve">Approve</button>
     </div>
@@ -707,6 +789,17 @@ function renderCartCard(cart) {
   el.querySelector('[data-cart-action="logs"]').addEventListener("click", () => {
     const c = state.carts.get(cart.session_id);
     if (c) { c.showLogs = !c.showLogs; state.carts.set(cart.session_id, c); renderCartGrid(); }
+  });
+  el.querySelector('[data-cart-action="copy-logs"]').addEventListener("click", (ev) => {
+    const text = cartLogsAsText(cart);
+    if (!text) return flashButton(ev.currentTarget, "Empty");
+    copyTextToClipboard(text, ev.currentTarget);
+  });
+  el.querySelector('[data-cart-action="export-logs"]').addEventListener("click", (ev) => {
+    const text = cartLogsAsText(cart);
+    if (!text) return flashButton(ev.currentTarget, "Empty");
+    const slug = (cart.account_phone || cart.session_id || "cart").replace(/[^a-z0-9]+/gi, "-");
+    downloadTextFile(text, `cart-${slug}-${timestampForFile()}.txt`);
   });
   el.querySelector('[data-cart-action="decline"]').addEventListener("click", async () => {
     await api.sessionStop(cart.session_id);

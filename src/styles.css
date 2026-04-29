@@ -253,7 +253,13 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
+.log-toolbar { display: inline-flex; gap: 4px; text-transform: none; letter-spacing: 0; }
+.log-toolbar .btn-sm { padding: 2px 8px; font-size: 11px; }
 
 .empty-state {
   padding: 40px 20px;
