@@ -1,6 +1,6 @@
 {
   "name": "dicebottk",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DiceBotTK — Dice.fm ticket automation with auth farm, tasks, and cart dashboard",
   "main": "src/main.js",
   "scripts": {
