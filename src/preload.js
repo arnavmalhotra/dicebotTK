@@ -45,6 +45,16 @@ contextBridge.exposeInMainWorld("api", {
   clearCodePool: (pool_id) => ipcRenderer.invoke("db:clear-code-pool", { pool_id }),
   drawCodesFromPool: (pool_id, count) => ipcRenderer.invoke("db:draw-codes-from-pool", { pool_id, count }),
 
+  // Proxy pools (auth farm proxy groups)
+  getProxyPools: invoke("db:get-proxy-pools"),
+  createProxyPool: (name) => ipcRenderer.invoke("db:create-proxy-pool", { name }),
+  renameProxyPool: (pool_id, name) => ipcRenderer.invoke("db:rename-proxy-pool", { pool_id, name }),
+  deleteProxyPool: (pool_id) => ipcRenderer.invoke("db:delete-proxy-pool", { pool_id }),
+  getProxyPoolProxies: (pool_id) => ipcRenderer.invoke("db:get-proxy-pool-proxies", { pool_id }),
+  addProxyPoolProxies: (pool_id, proxies) => ipcRenderer.invoke("db:add-proxy-pool-proxies", { pool_id, proxies }),
+  deleteProxyPoolProxy: (proxy_id) => ipcRenderer.invoke("db:delete-proxy-pool-proxy", { proxy_id }),
+  clearProxyPool: (pool_id) => ipcRenderer.invoke("db:clear-proxy-pool", { pool_id }),
+
   importFile: () => ipcRenderer.invoke("db:import-file"),
   getStats: invoke("db:get-stats"),
   getAccountsNeedingAuth: invoke("db:get-accounts-needing-auth"),

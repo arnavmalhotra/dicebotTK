@@ -21,6 +21,7 @@
         <button class="nav-btn" data-page="accounts">Accounts</button>
         <button class="nav-btn" data-page="profiles">Cards</button>
         <button class="nav-btn" data-page="codepools">Code Pools</button>
+        <button class="nav-btn" data-page="proxies">Proxies</button>
         <button class="nav-btn" data-page="auth">Auth Farm</button>
         <button class="nav-btn" data-page="settings">Settings</button>
       </nav>
@@ -261,6 +262,26 @@
         </div>
       </section>
 
+      <!-- ── Proxies ───────────────────────────────────────────────── -->
+      <section class="page" id="page-proxies">
+        <div class="page-header">
+          <div>
+            <h2>Proxies</h2>
+            <p class="muted">Group proxies by purpose. The Auth Farm page lets you pick a group to use for a farm run.</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-primary" id="addProxyPoolBtn">+ New proxy group</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title" id="proxyPoolsPanelTitle">All proxy groups</div>
+          <div id="proxyPoolsList">
+            <div class="empty-state">No proxy groups yet. Click "+ New proxy group" to create one.</div>
+          </div>
+        </div>
+      </section>
+
       <!-- ── Auth Farm ─────────────────────────────────────────────── -->
       <section class="page" id="page-auth">
         <div class="page-header">
@@ -283,7 +304,14 @@
           <div class="panel-title">Auth proxy pool</div>
           <div class="form-grid">
             <label>
-              <span>Proxy pool</span>
+              <span>Use saved proxy group</span>
+              <select id="authProxyPoolGroup">
+                <option value="">— use the textarea below —</option>
+              </select>
+            </label>
+            <p class="muted" style="font-size:11px; margin:-6px 0 0;">Manage groups under the <strong>Proxies</strong> tab. When a group is picked, the textarea is ignored.</p>
+            <label>
+              <span>Proxy pool (textarea fallback)</span>
               <textarea id="authProxyPool" rows="7" placeholder="host:port:user:pass&#10;user:pass@host:port&#10;http://user:pass@host:port"></textarea>
             </label>
             <div class="status-line muted" id="authProxyPoolStatus">0 proxies saved. Unauthenticated accounts borrow from this pool and keep the proxy only after a successful auth.</div>
@@ -401,11 +429,11 @@
           <div class="form-grid">
             <div style="grid-column:1 / -1;">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-                <span>Default auto-buy rules</span>
+                <span>Default carting rules</span>
                 <button type="button" class="btn btn-ghost btn-sm" id="defaultRulesAdd">+ Add rule</button>
               </div>
               <div id="defaultRulesList"></div>
-              <p class="muted" style="font-size:12px; margin:4px 0 0;">Each rule: buy N tickets if price is at most $X. New cart runs start with these. Evaluated in order — first matching rule wins.</p>
+              <p class="muted" style="font-size:12px; margin:4px 0 0;">Each rule: reserve N tickets if price is at most $X. New cart runs start with these. Evaluated in order — first matching rule wins. Cart still waits for in-app approval before checkout.</p>
             </div>
             <div class="form-buttons">
               <button class="btn btn-primary" id="saveSettingsBtn">Save settings</button>

@@ -17,6 +17,7 @@ const state = {
   carts: new Map(), // session_id -> cart info
   payment: { cards: [], pools: [], assignDropdownCardId: null },
   codePools: { pools: [], expanded: new Set(), codesByPool: new Map() },
+  proxyPools: { pools: [], expanded: new Set(), proxiesByPool: new Map() },
   authFarm: { sessionId: null, running: false, accountStatus: new Map(), attempts: [] },
   authRefresh: {
     sessionId: null,
@@ -230,7 +231,7 @@ function mountPriceRuleList(listEl, addBtn, initialRules) {
 
 function summarizePriceRules(rules) {
   const list = sanitizePriceRules(rules);
-  if (!list.length) return "No auto-buy rules";
+  if (!list.length) return "No carting rules";
   const r = list[0];
   let cond;
   if (r.min_price != null && r.max_price != null) {
@@ -268,6 +269,22 @@ function authProxyPoolValue({ persist = false, normalize = false } = {}) {
   return proxies;
 }
 
+async function resolveAuthProxyPool({ persist = false, normalize = false } = {}) {
+  // If a saved proxy group is selected, fetch and use it. Otherwise fall back
+  // to whatever's in the textarea.
+  const select = $("#authProxyPoolGroup");
+  const groupId = select ? Number(select.value || 0) : 0;
+  if (groupId) {
+    if (persist) saveSettings({ authProxyPoolGroupId: groupId });
+    const r = await api.getProxyPoolProxies(groupId);
+    const proxies = r.ok ? (r.data || []).map((row) => row.proxy).filter(Boolean) : [];
+    renderAuthProxyPoolStatus(proxies.length);
+    return proxies;
+  }
+  if (persist) saveSettings({ authProxyPoolGroupId: 0 });
+  return authProxyPoolValue({ persist, normalize });
+}
+
 function renderAuthProxyPoolStatus(count = null) {
   const status = $("#authProxyPoolStatus");
   if (!status) return;
@@ -303,6 +320,7 @@ $$("#navTabs .nav-btn").forEach((btn) => {
     if (page === "inventory") refreshInventory();
     if (page === "profiles") refreshPaymentCards();
     if (page === "codepools") refreshCodePools();
+    if (page === "proxies") refreshProxyPools();
     if (page === "tasks") refreshTasks();
   });
 });
@@ -599,7 +617,7 @@ $("#bulkAuthBtn").addEventListener("click", async () => {
   const accts = await Promise.all(ids.map((id) => api.getAccount(id)));
   const queue = accts.filter((r) => r.ok).map((r) => r.data);
   const concurrency = authFarmConcurrencyValue({ persist: true, normalize: true });
-  const authProxyPool = authProxyPoolValue({ persist: true, normalize: true });
+  const authProxyPool = await resolveAuthProxyPool({ persist: true, normalize: true });
   const r = await api.authFarm({ accounts: queue, concurrency, auth_proxy_pool: authProxyPool });
   if (r.ok) {
     state.authFarm.accountStatus.clear();
@@ -1351,6 +1369,215 @@ function openAddCodesToPoolModal(pool) {
 
 $("#addCodePoolBtn")?.addEventListener("click", openCreateCodePoolModal);
 
+// ── Proxy Pools ───────────────────────────────────────────────────────────
+
+async function refreshProxyPools() {
+  const r = await api.getProxyPools();
+  state.proxyPools.pools = r.ok ? (r.data || []) : [];
+  const validIds = new Set(state.proxyPools.pools.map((p) => p.id));
+  for (const id of Array.from(state.proxyPools.expanded)) {
+    if (!validIds.has(id)) state.proxyPools.expanded.delete(id);
+  }
+  await Promise.all(
+    Array.from(state.proxyPools.expanded).map(async (pid) => {
+      const pr = await api.getProxyPoolProxies(pid);
+      state.proxyPools.proxiesByPool.set(pid, pr.ok ? (pr.data || []) : []);
+    }),
+  );
+  renderProxyPoolsList();
+  syncAuthProxyPoolGroupSelect();
+}
+
+function syncAuthProxyPoolGroupSelect() {
+  const select = $("#authProxyPoolGroup");
+  if (!select) return;
+  const pools = state.proxyPools.pools || [];
+  const desired = Number(state.settings.authProxyPoolGroupId || 0);
+  const stillValid = pools.some((p) => p.id === desired);
+  const current = stillValid ? desired : 0;
+  select.innerHTML = `<option value="">— use the textarea below —</option>` +
+    pools.map((p) => `<option value="${p.id}" ${p.id === current ? "selected" : ""}>${escapeHtml(p.name)} (${p.proxy_count || 0})</option>`).join("");
+  applyAuthProxyPoolGroupVisibility();
+}
+
+function applyAuthProxyPoolGroupVisibility() {
+  const select = $("#authProxyPoolGroup");
+  const ta = $("#authProxyPool");
+  if (!select || !ta) return;
+  const usingGroup = Boolean(Number(select.value || 0));
+  ta.disabled = usingGroup;
+  ta.style.opacity = usingGroup ? "0.5" : "1";
+}
+
+function renderProxyPoolsList() {
+  const list = $("#proxyPoolsList");
+  const titleEl = $("#proxyPoolsPanelTitle");
+  if (!list) return;
+  const pools = state.proxyPools.pools || [];
+  if (titleEl) titleEl.textContent = `${pools.length} proxy group${pools.length === 1 ? "" : "s"}`;
+  if (!pools.length) {
+    list.innerHTML = '<div class="empty-state">No proxy groups yet. Click "+ New proxy group" to create one.</div>';
+    return;
+  }
+  list.innerHTML = pools.map((p) => {
+    const isOpen = state.proxyPools.expanded.has(p.id);
+    const proxies = state.proxyPools.proxiesByPool.get(p.id) || [];
+    const proxiesPanel = isOpen ? `
+      <div style="margin-top:12px;padding:12px;background:var(--bg-0);border-radius:6px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <div class="muted" style="font-size:12px;">${proxies.length} ${proxies.length === 1 ? "proxy" : "proxies"} in group</div>
+          <div style="display:flex;gap:6px;">
+            <button class="btn btn-ghost btn-sm" data-proxypool-action="add" data-pool-id="${p.id}">+ Add proxies</button>
+            <button class="btn btn-ghost btn-sm" data-proxypool-action="clear" data-pool-id="${p.id}" ${proxies.length ? "" : "disabled"}>Clear all</button>
+          </div>
+        </div>
+        ${proxies.length
+          ? `<div style="max-height:260px;overflow:auto;border:1px solid var(--border);border-radius:6px;">
+              ${proxies.map((px) => `
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;border-bottom:1px solid var(--border);">
+                  <code style="font-size:12px;">${escapeHtml(px.proxy)}</code>
+                  <button class="btn-icon" data-proxypool-action="delete-proxy" data-proxy-id="${px.id}" title="Remove this proxy">🗑</button>
+                </div>
+              `).join("")}
+            </div>`
+          : `<div class="muted" style="font-size:12px;">No proxies yet. Click "+ Add proxies" to paste a batch.</div>`}
+      </div>
+    ` : "";
+    return `
+      <div class="panel" style="margin-bottom:10px;padding:14px;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+          <div style="min-width:0;flex:1;">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <strong>${escapeHtml(p.name)}</strong>
+              <span class="badge badge-muted" style="font-size:11px;">${p.proxy_count || 0} ${p.proxy_count === 1 ? "proxy" : "proxies"}</span>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-shrink:0;">
+            <button class="btn btn-ghost btn-sm" data-proxypool-action="toggle" data-pool-id="${p.id}">${isOpen ? "Hide proxies" : "View proxies"}</button>
+            <button class="btn btn-ghost btn-sm" data-proxypool-action="rename" data-pool-id="${p.id}">Rename</button>
+            <button class="btn btn-ghost btn-sm" data-proxypool-action="delete" data-pool-id="${p.id}">Delete</button>
+          </div>
+        </div>
+        ${proxiesPanel}
+      </div>
+    `;
+  }).join("");
+
+  list.querySelectorAll("[data-proxypool-action]").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const action = btn.dataset.proxypoolAction;
+      if (action === "delete-proxy") {
+        const pxId = Number(btn.dataset.proxyId);
+        const r = await api.deleteProxyPoolProxy(pxId);
+        if (!r.ok) { alert("Delete failed: " + r.error); return; }
+        await refreshProxyPools();
+        return;
+      }
+      const pid = Number(btn.dataset.poolId);
+      const pool = state.proxyPools.pools.find((p) => p.id === pid);
+      if (!pool) return;
+      if (action === "toggle") {
+        if (state.proxyPools.expanded.has(pid)) {
+          state.proxyPools.expanded.delete(pid);
+        } else {
+          state.proxyPools.expanded.add(pid);
+          const pr = await api.getProxyPoolProxies(pid);
+          state.proxyPools.proxiesByPool.set(pid, pr.ok ? (pr.data || []) : []);
+        }
+        renderProxyPoolsList();
+      } else if (action === "rename") {
+        const nx = prompt(`Rename proxy group "${pool.name}" to:`, pool.name);
+        if (nx == null || nx.trim() === "" || nx.trim() === pool.name) return;
+        const r = await api.renameProxyPool(pid, nx.trim());
+        if (!r.ok) { alert("Rename failed: " + r.error); return; }
+        await refreshProxyPools();
+      } else if (action === "delete") {
+        if (!confirm(`Delete proxy group "${pool.name}"? Its ${pool.proxy_count || 0} ${pool.proxy_count === 1 ? "proxy" : "proxies"} will be removed.`)) return;
+        const r = await api.deleteProxyPool(pid);
+        if (!r.ok) { alert("Delete failed: " + r.error); return; }
+        state.proxyPools.expanded.delete(pid);
+        state.proxyPools.proxiesByPool.delete(pid);
+        await refreshProxyPools();
+      } else if (action === "add") {
+        openAddProxiesToPoolModal(pool);
+      } else if (action === "clear") {
+        if (!confirm(`Clear all proxies from "${pool.name}"? This cannot be undone.`)) return;
+        const r = await api.clearProxyPool(pid);
+        if (!r.ok) { alert("Clear failed: " + r.error); return; }
+        state.proxyPools.proxiesByPool.set(pid, []);
+        await refreshProxyPools();
+      }
+    });
+  });
+}
+
+function openCreateProxyPoolModal() {
+  openModal({
+    title: "New proxy group",
+    bodyHtml: `
+      <div class="form-grid">
+        <label><span>Group name</span><input id="pp_new_name" autofocus placeholder="e.g. Residential — auth farm" /></label>
+        <label><span>Proxies (optional — one per line)</span>
+          <textarea id="pp_new_proxies" rows="8" placeholder="host:port:user:pass&#10;user:pass@host:port&#10;http://user:pass@host:port"></textarea>
+        </label>
+        <p class="muted" style="font-size:12px;margin:0;">You can add more proxies later via "+ Add proxies" on the group.</p>
+      </div>
+    `,
+    footerHtml: `<button class="btn btn-ghost" data-close>Cancel</button>
+                 <button class="btn btn-primary" id="pp_new_save">Create</button>`,
+    onMount: () => {
+      $("#pp_new_save").addEventListener("click", async () => {
+        const name = $("#pp_new_name").value.trim();
+        if (!name) { alert("Group name is required."); return; }
+        const created = await api.createProxyPool(name);
+        if (!created.ok) { alert("Create failed: " + created.error); return; }
+        const pid = created.data?.id;
+        const proxies = parseLineList($("#pp_new_proxies").value);
+        if (pid && proxies.length) {
+          const r = await api.addProxyPoolProxies(pid, proxies);
+          if (!r.ok) { alert("Proxy import failed: " + r.error); }
+        }
+        closeModal();
+        await refreshProxyPools();
+      });
+    },
+  });
+}
+
+function openAddProxiesToPoolModal(pool) {
+  openModal({
+    title: `Add proxies to "${pool.name}"`,
+    bodyHtml: `
+      <p class="muted" style="font-size:12px;margin:0 0 8px;">Paste one proxy per line. Duplicates inside this group are skipped.</p>
+      <textarea id="pp_proxies_text" rows="12" style="width:100%;font-family:monospace;font-size:12px;" placeholder="host:port:user:pass&#10;user:pass@host:port&#10;http://user:pass@host:port" autofocus></textarea>
+      <div id="pp_proxies_status" class="status-line muted" style="margin-top:8px;">Paste proxies above to add them.</div>
+    `,
+    footerHtml: `<button class="btn btn-ghost" data-close>Cancel</button>
+                 <button class="btn btn-primary" id="pp_proxies_save">Add proxies</button>`,
+    onMount: () => {
+      $("#pp_proxies_save").addEventListener("click", async () => {
+        const proxies = parseLineList($("#pp_proxies_text").value);
+        const status = $("#pp_proxies_status");
+        if (!proxies.length) { status.textContent = "Nothing to add."; return; }
+        const r = await api.addProxyPoolProxies(pool.id, proxies);
+        if (!r.ok) { status.textContent = "Add failed: " + r.error; return; }
+        status.textContent = `Added ${r.data.added}, skipped ${r.data.skipped} (duplicates).`;
+        await refreshProxyPools();
+        closeModal();
+      });
+    },
+  });
+}
+
+$("#addProxyPoolBtn")?.addEventListener("click", openCreateProxyPoolModal);
+$("#authProxyPoolGroup")?.addEventListener("change", () => {
+  const select = $("#authProxyPoolGroup");
+  saveSettings({ authProxyPoolGroupId: Number(select.value || 0) });
+  applyAuthProxyPoolGroupVisibility();
+  resolveAuthProxyPool({ persist: false });
+});
+
 // ── Auth Farm ─────────────────────────────────────────────────────────────
 function authFarmConcurrencyValue({ persist = false, normalize = false } = {}) {
   const input = $("#farmConcurrency");
@@ -1415,7 +1642,7 @@ $("#startFarmBtn").addEventListener("click", async () => {
   const pending = await api.getAccountsNeedingAuth();
   if (!pending.ok || !pending.data?.length) { appendFarmLog("No accounts need auth.", "info"); return; }
   const concurrency = authFarmConcurrencyValue({ persist: true, normalize: true });
-  const authProxyPool = authProxyPoolValue({ persist: true, normalize: true });
+  const authProxyPool = await resolveAuthProxyPool({ persist: true, normalize: true });
   const r = await api.authFarm({ accounts: pending.data, concurrency, auth_proxy_pool: authProxyPool });
   if (r.ok) {
     state.authFarm.accountStatus.clear();
@@ -1754,13 +1981,8 @@ function formatTierBadges(tier) {
 async function launchCartRuns(accounts, common, options = {}) {
   const { perProfileCodes = null } = options;
   const failures = [];
-  const splitMode = String(common.fire_mode || "").toLowerCase() === "split";
-  const splitCutoff = splitMode ? Math.floor(accounts.length / 2) : 0;
-  await Promise.all(accounts.map(async (account, idx) => {
+  await Promise.all(accounts.map(async (account) => {
     const perTask = { ...common, account };
-    if (splitMode) {
-      perTask.pre_drop_fire_window_enabled = idx < splitCutoff;
-    }
     if (perProfileCodes) {
       const code = perProfileCodes.get(account.id);
       perTask.presale_code = code || "";
@@ -2254,11 +2476,6 @@ async function openCartModal(options = {}) {
   const presetStrategy = ["cheapest", "most_expensive"].includes(presetStrategyRaw)
     ? presetStrategyRaw
     : "cheapest";
-  const presetFireMode = (() => {
-    const explicit = String(defaults.fire_mode || "").toLowerCase();
-    if (["predrop", "ondrop", "split"].includes(explicit)) return explicit;
-    return defaults.pre_drop_fire_window_enabled === true ? "predrop" : "ondrop";
-  })();
   const presetKeywords = (() => {
     if (typeof defaults.tier_keywords === "string") return defaults.tier_keywords;
     if (Array.isArray(defaults.tier_keywords)) return defaults.tier_keywords.join(" ");
@@ -2313,11 +2530,11 @@ async function openCartModal(options = {}) {
   const rulesHtml = `
     <div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-        <span>Auto-buy rules</span>
+        <span>Carting rules</span>
         <button type="button" class="btn btn-ghost btn-sm" id="c_rules_add">+ Add rule</button>
       </div>
       <div id="c_rules_list"></div>
-      <p class="muted" style="font-size:12px; margin:4px 0 0;">Each rule: buy N tickets if the tier price is between $min and $max. All three fields are optional — qty defaults to 1, blank min/max means no bound. Evaluated in order; first matching rule wins. Leave the list empty to buy whatever the strategy picks at any price.</p>
+      <p class="muted" style="font-size:12px; margin:4px 0 0;">Each rule: reserve N tickets if the tier price is between $min and $max. All three fields are optional — qty defaults to 1, blank min/max means no bound. Evaluated in order; first matching rule wins. Leave the list empty to reserve whatever the strategy picks at any price. Cart still waits for your in-app approval before checkout.</p>
     </div>
   `;
   const tierBlock = `${tierInfoHtml}${tierInputHtml}${rulesHtml}`;
@@ -2387,15 +2604,7 @@ async function openCartModal(options = {}) {
             <select id="c_tz">${tzSelectOptions("")}</select>
           </label>
         </div>
-        <p class="muted" style="font-size:11px; margin:-6px 0 0;">At T-3s the cart starts polling tiers; it fires the moment a reserve token appears at drop.</p>
-        <label><span>Fire timing</span>
-          <select id="c_fire_mode">
-            <option value="predrop" ${presetFireMode === "predrop" ? "selected" : ""}>Predrop ATC (fire within 4 min of drop)</option>
-            <option value="ondrop" ${presetFireMode === "ondrop" ? "selected" : ""}>On-drop ATC (hold until drop instant)</option>
-            <option value="split" ${presetFireMode === "split" ? "selected" : ""}>Split — half predrop, half on-drop</option>
-          </select>
-          <p class="muted" style="font-size:11px; margin:4px 0 0;">Predrop: fire as soon as a reserve token is available within 4 min of drop. On-drop: hold strictly until the scheduled instant. Split: half the launched profiles use predrop, the other half on-drop.</p>
-        </label>
+        <p class="muted" style="font-size:11px; margin:-6px 0 0;">Cart polls tiers as the drop approaches and fires strictly on the scheduled instant — no pre-drop firing.</p>
         <label><span>Card label</span>
           <select id="c_card_label">
             <option value="">Use account default card</option>
@@ -2403,12 +2612,7 @@ async function openCartModal(options = {}) {
           </select>
         </label>
         <p class="muted" style="font-size:11px; margin:-6px 0 0;">When a label is picked, each account uses its assigned card with that label. Manage cards under the Cards tab.</p>
-        <label><span>Mode</span>
-          <select id="c_mode" ${lockMode ? "disabled" : ""}>
-            <option value="manual" ${presetMode === "manual" ? "selected" : ""}>Reserve only (manual approve)</option>
-            <option value="auto" ${presetMode === "auto" ? "selected" : ""}>Reserve + auto-checkout</option>
-          </select>
-        </label>
+        <p class="muted" style="font-size:11px; margin:0;">Every cart waits for in-app approval before checkout — there is no auto-checkout in TK.</p>
         <div>
           <div style="margin-bottom:6px;">Access code (optional — for locked / presale events)</div>
           <div class="chip-row" id="c_code_mode_chips" style="display:flex;gap:6px;flex-wrap:wrap;">
@@ -2804,10 +3008,6 @@ async function openCartModal(options = {}) {
           alert("You fetched tiers but didn't keep any checked. Pick at least one acceptable tier or click Clear → Cancel and use keyword filtering instead.");
           return;
         }
-        const fireModeRaw = String($("#c_fire_mode")?.value || "predrop").toLowerCase();
-        const fireMode = ["predrop", "ondrop", "split"].includes(fireModeRaw) ? fireModeRaw : "predrop";
-        const fireWindowEnabled = fireMode !== "ondrop";
-
         const singleCode = codeMode === "single" ? ($("#c_code")?.value.trim() || "") : "";
         const codePoolId = codeMode === "pool"
           ? Number($("#c_code_pool")?.value || 0) || null
@@ -2853,9 +3053,7 @@ async function openCartModal(options = {}) {
           quantity: 1,
           scheduled_at: scheduledAt || "",
           scheduled_tz: scheduledAt ? $("#c_tz").value : "",
-          pre_drop_fire_window_enabled: fireWindowEnabled,
-          fire_mode: fireMode,
-          mode: lockMode ? presetMode : $("#c_mode").value,
+          mode: "manual",
           capsolver_key: state.settings.capsolverKey || null,
           twocaptcha_key: state.settings.twocaptchaKey || null,
           approval_webhook_url: state.settings.approvalWebhookUrl || null,
@@ -3115,7 +3313,7 @@ function renderTaskCard(t) {
       <span class="task-status-pill ${running ? "running" : t.status}">${escapeHtml(t.status || "idle")}</span>
     </div>
     <div class="task-meta">
-      <div>Tier: ${escapeHtml(t.ticket_tier || "any")} · Qty: ${escapeHtml(String(t.quantity || 1))} · ${escapeHtml(t.mode || "auto")}</div>
+      <div>Tier: ${escapeHtml(t.ticket_tier || "any")} · Qty: ${escapeHtml(String(t.quantity || 1))}</div>
       <div>Price: ${escapeHtml(priceRange)}${t.presale_code ? ` · Presale: ${escapeHtml(t.presale_code)}` : ""}</div>
       ${t.scheduled_at ? `<div>Drop: ${escapeHtml(t.scheduled_at.replace("T"," "))} ${escapeHtml(t.scheduled_tz || "")}</div>` : ""}
       ${t.last_error ? `<div style="color:#fff; margin-top:4px;">Last error: ${escapeHtml(t.last_error)}</div>` : ""}
@@ -3241,15 +3439,7 @@ async function openTaskModal(task) {
           <label><span>Min price</span><input id="t_min" type="number" step="0.01" value="${t.min_price ?? state.settings.defaultMinPrice ?? ""}" /></label>
           <label><span>Max price</span><input id="t_max" type="number" step="0.01" value="${t.max_price ?? state.settings.defaultMaxPrice ?? ""}" /></label>
         </div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <label><span>Quantity</span><input id="t_qty" type="number" min="1" step="1" value="${t.quantity ?? 1}" /></label>
-          <label><span>Mode</span>
-            <select id="t_mode">
-              <option value="auto" ${t.mode !== "manual" ? "selected" : ""}>Auto checkout</option>
-              <option value="manual" ${t.mode === "manual" ? "selected" : ""}>Reserve only (manual)</option>
-            </select>
-          </label>
-        </div>
+        <label><span>Quantity</span><input id="t_qty" type="number" min="1" step="1" value="${t.quantity ?? 1}" /></label>
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
           <label><span>Scheduled drop (leave blank to run immediately)</span>
             <input id="t_sched" type="datetime-local" step="1" value="${escapeHtml(t.scheduled_at || "")}" />
@@ -3272,7 +3462,7 @@ async function openTaskModal(task) {
           min_price: $("#t_min").value,
           max_price: $("#t_max").value,
           quantity: parseInt($("#t_qty").value, 10) || 1,
-          mode: $("#t_mode").value,
+          mode: "manual",
           scheduled_at: $("#t_sched").value.trim(),
           scheduled_tz: $("#t_sched").value.trim() ? $("#t_tz").value : "",
         };
@@ -3306,16 +3496,7 @@ function openBulkEditTasksModal() {
           <label><span>Min price</span><input id="bt_min" type="number" step="0.01" /></label>
           <label><span>Max price</span><input id="bt_max" type="number" step="0.01" /></label>
         </div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <label><span>Quantity</span><input id="bt_qty" type="number" min="1" step="1" /></label>
-          <label><span>Mode</span>
-            <select id="bt_mode">
-              <option value="">(keep)</option>
-              <option value="auto">Auto checkout</option>
-              <option value="manual">Reserve only (manual)</option>
-            </select>
-          </label>
-        </div>
+        <label><span>Quantity</span><input id="bt_qty" type="number" min="1" step="1" /></label>
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
           <label><span>Scheduled drop</span><input id="bt_sched" type="datetime-local" step="1" /></label>
           <label><span>Timezone</span><select id="bt_tz"><option value="">(keep)</option>${tzSelectOptions("")}</select></label>
@@ -3334,7 +3515,6 @@ function openBulkEditTasksModal() {
         const min = $("#bt_min").value; if (min !== "") patches.min_price = min;
         const max = $("#bt_max").value; if (max !== "") patches.max_price = max;
         const qty = $("#bt_qty").value; if (qty !== "") patches.quantity = parseInt(qty, 10) || 1;
-        const mode = $("#bt_mode").value; if (mode) patches.mode = mode;
         const schedRaw = $("#bt_sched").value.trim();
         const tzRaw = $("#bt_tz").value;
         let clearSched = false;
@@ -3360,7 +3540,7 @@ function openBulkEditTasksModal() {
             min_price: patches.min_price ?? cur.min_price ?? "",
             max_price: patches.max_price ?? cur.max_price ?? "",
             quantity: patches.quantity ?? cur.quantity ?? 1,
-            mode: patches.mode ?? cur.mode ?? "auto",
+            mode: "manual",
             scheduled_at: clearSched ? "" : (patches.scheduled_at ?? cur.scheduled_at ?? ""),
             scheduled_tz: clearSched ? "" : (patches.scheduled_tz ?? cur.scheduled_tz ?? ""),
           };
@@ -3378,6 +3558,7 @@ hydrateSettingsForm();
 refreshDashboard();
 refreshInventory();
 refreshTasks();
+refreshProxyPools();
 api.getUpdateState().then((res) => {
   if (res.ok) setUpdateState(res.data);
 });

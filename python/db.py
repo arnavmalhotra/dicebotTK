@@ -91,7 +91,7 @@ def init_db() -> None:
                 presale_code TEXT DEFAULT '',
                 ticket_tier TEXT DEFAULT '',
                 quantity INTEGER DEFAULT 1,
-                mode TEXT DEFAULT 'auto',
+                mode TEXT DEFAULT 'manual',
                 scheduled_at TEXT DEFAULT '',
                 scheduled_tz TEXT DEFAULT '',
                 status TEXT DEFAULT 'idle',
@@ -172,6 +172,21 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_code_pool_codes_pool ON code_pool_codes(pool_id);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_code_pool_codes_unique ON code_pool_codes(pool_id, code);
+
+            CREATE TABLE IF NOT EXISTS proxy_pools (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS proxy_pool_proxies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pool_id INTEGER NOT NULL REFERENCES proxy_pools(id) ON DELETE CASCADE,
+                proxy TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_proxy_pool_proxies_pool ON proxy_pool_proxies(pool_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_pool_proxies_unique ON proxy_pool_proxies(pool_id, proxy);
         """)
         _ensure_columns(conn, "accounts", {
             "imap_email": "TEXT DEFAULT ''",
@@ -623,6 +638,121 @@ def draw_codes_from_pool(pool_id: int, count: int) -> list[str]:
     ).fetchall()
     conn.close()
     return [r["code"] for r in rows]
+
+
+# ── Proxy pools (auth farm proxy groups) ──────────────────────────────────
+
+def get_proxy_pools() -> list[dict]:
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT p.id, p.name, p.created_at,
+               (SELECT COUNT(*) FROM proxy_pool_proxies pp WHERE pp.pool_id = p.id) AS proxy_count
+        FROM proxy_pools p
+        ORDER BY p.name
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def create_proxy_pool(name: str) -> int:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Pool name is required")
+    with _lock:
+        conn = _connect()
+        cur = conn.execute("INSERT INTO proxy_pools (name) VALUES (?)", (name,))
+        conn.commit()
+        pid = cur.lastrowid
+        conn.close()
+        return int(pid)
+
+
+def rename_proxy_pool(pool_id: int, name: str) -> None:
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Pool name is required")
+    with _lock:
+        conn = _connect()
+        conn.execute(
+            "UPDATE proxy_pools SET name = ? WHERE id = ?",
+            (name, int(pool_id)),
+        )
+        conn.commit()
+        conn.close()
+
+
+def delete_proxy_pool(pool_id: int) -> None:
+    with _lock:
+        conn = _connect()
+        conn.execute("DELETE FROM proxy_pools WHERE id = ?", (int(pool_id),))
+        conn.commit()
+        conn.close()
+
+
+def get_proxy_pool_proxies(pool_id: int) -> list[dict]:
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, pool_id, proxy, created_at FROM proxy_pool_proxies WHERE pool_id = ? ORDER BY id",
+        (int(pool_id),),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_proxy_pool_proxies(pool_id: int, proxies: list[str]) -> dict:
+    """Insert a batch of proxies into the pool. Skips blanks and dupes within the same pool."""
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in proxies or []:
+        p = str(raw or "").strip()
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        cleaned.append(p)
+    if not cleaned:
+        return {"added": 0, "skipped": 0}
+    added = 0
+    skipped = 0
+    with _lock:
+        conn = _connect()
+        for p in cleaned:
+            try:
+                conn.execute(
+                    "INSERT INTO proxy_pool_proxies (pool_id, proxy) VALUES (?, ?)",
+                    (int(pool_id), p),
+                )
+                added += 1
+            except sqlite3.IntegrityError:
+                skipped += 1
+        conn.commit()
+        conn.close()
+    return {"added": added, "skipped": skipped}
+
+
+def delete_proxy_pool_proxy(proxy_id: int) -> None:
+    with _lock:
+        conn = _connect()
+        conn.execute("DELETE FROM proxy_pool_proxies WHERE id = ?", (int(proxy_id),))
+        conn.commit()
+        conn.close()
+
+
+def clear_proxy_pool(pool_id: int) -> None:
+    with _lock:
+        conn = _connect()
+        conn.execute("DELETE FROM proxy_pool_proxies WHERE pool_id = ?", (int(pool_id),))
+        conn.commit()
+        conn.close()
+
+
+def get_proxy_pool_proxy_strings(pool_id: int) -> list[str]:
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT proxy FROM proxy_pool_proxies WHERE pool_id = ? ORDER BY id",
+        (int(pool_id),),
+    ).fetchall()
+    conn.close()
+    return [r["proxy"] for r in rows]
 
 
 # ── Accounts ──────────────────────────────────────────────────────────────
@@ -1135,7 +1265,7 @@ def create_task(account_id: int, **fields) -> int:
             clean.get("presale_code") or "",
             clean.get("ticket_tier") or "",
             int(clean.get("quantity") or 1),
-            clean.get("mode") or "auto",
+            "manual",  # TK forces manual approval — auto-checkout disabled
             clean.get("scheduled_at") or "",
             clean.get("scheduled_tz") or "",
             1 if clean.get("ephemeral") else 0,
@@ -1270,7 +1400,7 @@ def import_tasks_file(file_path: str) -> dict:
                 presale_code=_col(cleaned, "code", "presalecode", "accesscode"),
                 ticket_tier=_col(cleaned, "tier", "tickettier"),
                 quantity=qty,
-                mode=_col(cleaned, "mode") or "auto",
+                mode="manual",  # TK forces manual approval — auto-checkout disabled
             )
         except Exception as exc:
             skipped += 1

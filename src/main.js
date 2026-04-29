@@ -364,13 +364,6 @@ function createWindow() {
     Menu.setApplicationMenu(null);
   }
   mainWindow.loadFile(path.join(__dirname, "index.html"));
-  if (!app.isPackaged) {
-    mainWindow.webContents.openDevTools({ mode: "detach" });
-    mainWindow.webContents.on("console-message", (e) => {
-      const detail = e?.message ?? e;
-      console.error(`[renderer:${e?.level ?? "log"}] ${detail}${e?.sourceId ? ` (${e.sourceId}:${e.lineNumber})` : ""}`);
-    });
-  }
   mainWindow.webContents.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown") return;
     const key = input.key;
@@ -424,6 +417,14 @@ function registerIpc() {
     ["db:delete-code-pool-code", "db.delete_code_pool_code"],
     ["db:clear-code-pool", "db.clear_code_pool"],
     ["db:draw-codes-from-pool", "db.draw_codes_from_pool"],
+    ["db:get-proxy-pools", "db.get_proxy_pools"],
+    ["db:create-proxy-pool", "db.create_proxy_pool"],
+    ["db:rename-proxy-pool", "db.rename_proxy_pool"],
+    ["db:delete-proxy-pool", "db.delete_proxy_pool"],
+    ["db:get-proxy-pool-proxies", "db.get_proxy_pool_proxies"],
+    ["db:add-proxy-pool-proxies", "db.add_proxy_pool_proxies"],
+    ["db:delete-proxy-pool-proxy", "db.delete_proxy_pool_proxy"],
+    ["db:clear-proxy-pool", "db.clear_proxy_pool"],
     ["db:get-stats", "db.get_stats"],
     ["db:get-accounts-needing-auth", "db.get_accounts_needing_auth"],
     ["db:get-accounts-with-valid-session", "db.get_accounts_with_valid_session"],

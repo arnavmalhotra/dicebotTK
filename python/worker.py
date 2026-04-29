@@ -363,6 +363,47 @@ def m_db_draw_codes_from_pool(params):
     )
 
 
+# ── Proxy pools ───────────────────────────────────────────────────────────
+
+def m_db_get_proxy_pools(_):
+    return db.get_proxy_pools()
+
+
+def m_db_create_proxy_pool(params):
+    return {"id": db.create_proxy_pool(params["name"])}
+
+
+def m_db_rename_proxy_pool(params):
+    db.rename_proxy_pool(int(params["pool_id"]), params["name"])
+    return {"ok": True}
+
+
+def m_db_delete_proxy_pool(params):
+    db.delete_proxy_pool(int(params["pool_id"]))
+    return {"ok": True}
+
+
+def m_db_get_proxy_pool_proxies(params):
+    return db.get_proxy_pool_proxies(int(params["pool_id"]))
+
+
+def m_db_add_proxy_pool_proxies(params):
+    return db.add_proxy_pool_proxies(
+        int(params["pool_id"]),
+        list(params.get("proxies") or []),
+    )
+
+
+def m_db_delete_proxy_pool_proxy(params):
+    db.delete_proxy_pool_proxy(int(params["proxy_id"]))
+    return {"ok": True}
+
+
+def m_db_clear_proxy_pool(params):
+    db.clear_proxy_pool(int(params["pool_id"]))
+    return {"ok": True}
+
+
 def m_db_import_file(params):
     gid = params.get("group_id")
     count = db.import_file(params["file_path"], int(gid) if gid is not None else None)
@@ -416,7 +457,7 @@ def _task_fields_from_params(params: dict) -> dict:
         "presale_code": params.get("presale_code") or "",
         "ticket_tier": params.get("ticket_tier") or "",
         "quantity": int(params.get("quantity") or 1),
-        "mode": params.get("mode") or "auto",
+        "mode": "manual",  # TK forces manual approval — auto-checkout is disabled
         "scheduled_at": params.get("scheduled_at") or "",
         "scheduled_tz": params.get("scheduled_tz") or "",
         "ephemeral": bool(params.get("ephemeral")),
@@ -1521,10 +1562,9 @@ def _run_cart_inner(
                 else:
                     return False, f"Access code claim failed: {access_code_error}"
 
-    fire_window_enabled = params.get("pre_drop_fire_window_enabled")
-    if fire_window_enabled is None:
-        fire_window_enabled = True
-    fire_window_seconds = _PRE_DROP_FIRE_WINDOW if fire_window_enabled else 0.0
+    # TK fires strictly on drop — no pre-drop fire window. Ignore any
+    # incoming pre_drop_fire_window_enabled / fire_mode params.
+    fire_window_seconds = 0.0
 
     has_probe_token = client.reserveToken and not (
         presale_code and scheduled_future and not getattr(client, "accessCodeClaimed", False)
@@ -1611,13 +1651,11 @@ def _run_cart_inner(
         )
         log(quantity_warning)
 
-    mode = params.get("mode", "auto")
+    # TK has auto-checkout disabled — every cart waits for approval, regardless
+    # of what the params say. Webhook approval still works alongside in-app.
+    mode = "manual"
     approval_cfg = _approval_config(params)
-    approval_required = (
-        bool(params.get("require_approval"))
-        or mode == "manual"
-        or bool(approval_cfg["webhook_url"] and approval_cfg["poll_url"])
-    )
+    approval_required = True
     if approval_required:
         approved, approval_error = _wait_for_checkout_approval(
             sid=sid,
@@ -1747,7 +1785,7 @@ def _run_task(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dic
         "presale_code": task.get("presale_code") or "",
         "ticket_tier": task.get("ticket_tier") or "",
         "quantity": int(task.get("quantity") or 1),
-        "mode": task.get("mode") or "auto",
+        "mode": "manual",  # TK forces manual approval — auto-checkout is disabled
         "scheduled_at": task.get("scheduled_at") or "",
         "scheduled_tz": task.get("scheduled_tz") or "",
         "capsolver_key": params.get("capsolver_key"),
@@ -1901,6 +1939,14 @@ METHODS = {
     "db.add_code_pool_codes": m_db_add_code_pool_codes,
     "db.delete_code_pool_code": m_db_delete_code_pool_code,
     "db.clear_code_pool": m_db_clear_code_pool,
+    "db.get_proxy_pools": m_db_get_proxy_pools,
+    "db.create_proxy_pool": m_db_create_proxy_pool,
+    "db.rename_proxy_pool": m_db_rename_proxy_pool,
+    "db.delete_proxy_pool": m_db_delete_proxy_pool,
+    "db.get_proxy_pool_proxies": m_db_get_proxy_pool_proxies,
+    "db.add_proxy_pool_proxies": m_db_add_proxy_pool_proxies,
+    "db.delete_proxy_pool_proxy": m_db_delete_proxy_pool_proxy,
+    "db.clear_proxy_pool": m_db_clear_proxy_pool,
     "db.draw_codes_from_pool": m_db_draw_codes_from_pool,
     "db.import_file": m_db_import_file,
     "db.get_stats": m_db_get_stats,
