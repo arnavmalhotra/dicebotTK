@@ -1290,6 +1290,13 @@ def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder
         country_iso, local_digits = _split_phone(account.get("phone") or "")
         local_driver_ref = {"driver": None}
         account_id = int(account["id"])
+        # Drop any stale manual OTP the user may have submitted on a prior
+        # pass — Dice OTPs are one-time-use and reusing a stale code wastes
+        # a "Send code" attempt and risks rate-limiting the phone number.
+        try:
+            otp_holder.get("by_account", {}).pop(account_id, None)
+        except AttributeError:
+            pass
         account_has_valid_auth = db.account_has_valid_session(account_id)
         retained_proxy = str(account.get("proxy") or "").strip() if account_has_valid_auth else ""
         borrowed_proxy = None if account_has_valid_auth else borrow_auth_proxy()

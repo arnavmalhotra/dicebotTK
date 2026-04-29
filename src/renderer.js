@@ -15,7 +15,7 @@ const state = {
   payment: { cards: [], pools: [], assignDropdownCardId: null },
   codePools: { pools: [], expanded: new Set(), codesByPool: new Map() },
   proxyPools: { pools: [], expanded: new Set(), proxiesByPool: new Map() },
-  authFarm: { sessionId: null, running: false, accountStatus: new Map(), attempts: [], awaitingOtp: new Set() },
+  authFarm: { sessionId: null, running: false, accountStatus: new Map(), attempts: [], awaitingOtp: new Set(), otpDeadlines: new Map() },
   authRefresh: {
     sessionId: null,
     running: false,
@@ -1628,6 +1628,7 @@ function renderAuthQueue(accounts) {
     const status = state.authFarm.accountStatus.get(a.id) || "pending";
     const showOtp = status === "running" || state.authFarm.awaitingOtp.has(a.id);
     const waiting = state.authFarm.awaitingOtp.has(a.id);
+    const deadline = state.authFarm.otpDeadlines.get(a.id);
     const otpHtml = showOtp ? `
       <div class="queue-otp" style="display:flex;gap:6px;align-items:center;${waiting ? "outline:1px solid var(--warn);padding:4px 6px;border-radius:6px;" : ""}">
         <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="10"
@@ -1635,6 +1636,7 @@ function renderAuthQueue(accounts) {
                data-otp-account="${a.id}"
                style="width:120px;font-family:monospace;" />
         <button type="button" class="btn btn-ghost btn-sm" data-otp-submit="${a.id}">Submit</button>
+        ${deadline ? `<span class="otp-countdown muted" data-otp-deadline="${deadline}" style="font-size:11px;font-family:monospace;min-width:42px;"></span>` : ""}
       </div>
     ` : "";
     row.innerHTML = `
@@ -3163,6 +3165,7 @@ api.onEvent((msg) => {
     state.authFarm.accountStatus.set(msg.account_id, msg.status);
     if (msg.status === "ok" || msg.status === "fail") {
       state.authFarm.awaitingOtp.delete(msg.account_id);
+      state.authFarm.otpDeadlines.delete(msg.account_id);
     }
     recordAuthAttempt(msg);
     refreshAuthFarm();
@@ -3171,16 +3174,27 @@ api.onEvent((msg) => {
     return;
   }
   if (msg.type === "await_otp") {
+    const aid = msg.account_id != null ? Number(msg.account_id) : null;
+    const isFarm = msg.session_id && msg.session_id === state.authFarm.sessionId && aid != null;
     if (msg.status === "waiting") {
-      // Farm session: highlight the inline OTP input on the queue card
-      // instead of popping a blocking prompt. Single-login session: keep the
-      // legacy prompt() fallback.
-      if (msg.session_id && msg.session_id === state.authFarm.sessionId && msg.account_id != null) {
-        state.authFarm.awaitingOtp.add(Number(msg.account_id));
+      if (isFarm) {
+        state.authFarm.awaitingOtp.add(aid);
+        const ttl = Number(msg.timeout_seconds) || 0;
+        if (ttl > 0) state.authFarm.otpDeadlines.set(aid, Date.now() / 1000 + ttl);
+        else state.authFarm.otpDeadlines.delete(aid);
         renderAuthFarm();
-        appendFarmLog(`OTP needed for account ${msg.account_id} — enter it on the queue card.`, "warning");
+        appendFarmLog(`OTP needed for account ${aid} — enter it on the queue card.`, "warning");
       } else {
         promptManualOtp(msg);
+      }
+    } else if (msg.status === "received" || msg.status === "timeout") {
+      if (isFarm) {
+        state.authFarm.awaitingOtp.delete(aid);
+        state.authFarm.otpDeadlines.delete(aid);
+        if (msg.status === "timeout") {
+          appendFarmLog(`OTP wait timed out for account ${aid}.`, "error");
+        }
+        renderAuthFarm();
       }
     }
     return;
@@ -3289,6 +3303,15 @@ setInterval(() => {
     el.textContent = `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
     el.classList.toggle("warn", remaining < 60 && remaining >= 15);
     el.classList.toggle("danger", remaining < 15);
+  });
+  $$(".otp-countdown").forEach((el) => {
+    const until = Number(el.dataset.otpDeadline);
+    if (!until) return;
+    const remaining = Math.max(0, until - Date.now() / 1000);
+    const mm = Math.floor(remaining / 60);
+    const ss = Math.floor(remaining % 60);
+    el.textContent = `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+    el.style.color = remaining < 30 ? "var(--danger)" : (remaining < 60 ? "var(--warn)" : "");
   });
 }, 500);
 
