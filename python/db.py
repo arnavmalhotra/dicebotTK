@@ -743,6 +743,28 @@ def account_has_valid_session(account_id: int) -> bool:
     return (time.time() - row["saved_at"]) < SESSION_MAX_AGE
 
 
+def clear_proxies_without_valid_session() -> int:
+    """Drop stored proxies on accounts whose session is missing or expired.
+    Lets borrowed pool proxies be reclaimed before each farm run."""
+    now = time.time()
+    with _lock:
+        conn = _connect()
+        cur = conn.execute("""
+            UPDATE accounts
+            SET proxy = ''
+            WHERE COALESCE(proxy, '') <> ''
+              AND NOT EXISTS (
+                SELECT 1 FROM sessions s
+                WHERE s.account_id = accounts.id
+                  AND (? - s.saved_at) < ?
+              )
+        """, (now, SESSION_MAX_AGE))
+        changed = cur.rowcount or 0
+        conn.commit()
+        conn.close()
+        return changed
+
+
 # ── Stats ─────────────────────────────────────────────────────────────────
 
 def get_stats() -> dict:

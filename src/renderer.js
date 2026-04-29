@@ -32,6 +32,32 @@ function saveSettings(patch) {
   localStorage.setItem("dicebot.settings", JSON.stringify(state.settings));
 }
 
+function parseLineList(raw) {
+  return String(raw || "")
+    .split(/\r?\n|,/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function authProxyPoolValue({ persist = false, normalize = false } = {}) {
+  const input = $("#authProxyPool");
+  const fallback = Array.isArray(state.settings.authProxyPool)
+    ? state.settings.authProxyPool.join("\n")
+    : String(state.settings.authProxyPool || "");
+  const proxies = [...new Set(parseLineList(input ? input.value : fallback))];
+  if (normalize && input) input.value = proxies.join("\n");
+  if (persist) saveSettings({ authProxyPool: proxies });
+  renderAuthProxyPoolStatus(proxies.length);
+  return proxies;
+}
+
+function renderAuthProxyPoolStatus(count = null) {
+  const status = $("#authProxyPoolStatus");
+  if (!status) return;
+  const total = count == null ? authProxyPoolValue().length : count;
+  status.textContent = `${total} ${total === 1 ? "proxy" : "proxies"} saved. Unauthenticated accounts borrow from this pool and keep the proxy only after a successful auth.`;
+}
+
 function formatVersionLabel(version) {
   const clean = String(version || "").replace(/^v/i, "").trim();
   return clean ? `v${clean}` : "";
@@ -146,6 +172,13 @@ function hydrateSettingsForm() {
   $("#defaultMinPrice").value = state.settings.defaultMinPrice ?? "";
   $("#defaultMaxPrice").value = state.settings.defaultMaxPrice ?? "";
   $("#defaultTier").value = state.settings.defaultTier || "";
+  const poolInput = $("#authProxyPool");
+  if (poolInput) {
+    poolInput.value = Array.isArray(state.settings.authProxyPool)
+      ? state.settings.authProxyPool.join("\n")
+      : String(state.settings.authProxyPool || "");
+  }
+  renderAuthProxyPoolStatus();
 }
 $("#saveSettingsBtn").addEventListener("click", () => {
   saveSettings({
@@ -162,6 +195,12 @@ $("#saveSettingsBtn").addEventListener("click", () => {
   el.textContent = "Saved.";
   setTimeout(() => (el.textContent = "—"), 2000);
 });
+
+const authProxyPoolEl = $("#authProxyPool");
+if (authProxyPoolEl) {
+  authProxyPoolEl.addEventListener("input", () => authProxyPoolValue({ persist: true }));
+  authProxyPoolEl.addEventListener("blur", () => authProxyPoolValue({ persist: true, normalize: true }));
+}
 
 // ── Accounts ──────────────────────────────────────────────────────────────
 async function refreshAccounts() {
@@ -335,11 +374,12 @@ $("#bulkAuthBtn").addEventListener("click", async () => {
   if (!ids.length) return;
   const accts = await Promise.all(ids.map((id) => api.getAccount(id)));
   const queue = accts.filter((r) => r.ok).map((r) => r.data);
-  const r = await api.authFarm(queue, farmConcurrency());
+  const pool = authProxyPoolValue({ persist: true, normalize: true });
+  const r = await api.authFarm(queue, farmConcurrency(), pool);
   if (r.ok) {
     state.authFarm.sessionId = r.data.session_id;
     state.authFarm.running = true;
-    appendFarmLog(`Farm started — ${queue.length} selected accounts`);
+    appendFarmLog(`Farm started — ${queue.length} selected accounts · proxy pool ${pool.length}`);
     gotoPage("auth");
   } else {
     alert("Farm failed to start: " + r.error);
@@ -585,7 +625,8 @@ $("#refreshAuthBtn").addEventListener("click", refreshAuthFarm);
 $("#startFarmBtn").addEventListener("click", async () => {
   const pending = await api.getAccountsNeedingAuth();
   if (!pending.ok || !pending.data?.length) { appendFarmLog("No accounts need auth.", "info"); return; }
-  const r = await api.authFarm(pending.data, farmConcurrency());
+  const pool = authProxyPoolValue({ persist: true, normalize: true });
+  const r = await api.authFarm(pending.data, farmConcurrency(), pool);
   if (r.ok) {
     state.authFarm.sessionId = r.data.session_id;
     state.authFarm.running = true;

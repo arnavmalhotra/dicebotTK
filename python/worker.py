@@ -436,6 +436,56 @@ def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder
     _event(sid, type="status", status="starting", total=len(accounts), concurrency=concurrency)
     log(f"Farm starting — {len(accounts)} accounts, concurrency={concurrency}")
 
+    cleared = db.clear_proxies_without_valid_session()
+    if cleared:
+        log(f"Cleared {cleared} stale proxy assignment{'s' if cleared != 1 else ''} from unauthenticated accounts.")
+
+    auth_proxy_pool = [str(x).strip() for x in (params.get("auth_proxy_pool") or []) if str(x).strip()]
+    auth_proxy_pool = list(dict.fromkeys(auth_proxy_pool))
+    proxy_lock = threading.Lock()
+    proxy_cursor = 0
+    proxies_in_flight: set[str] = set()
+    proxies_assigned_this_run: set[str] = set()
+    proxies_retained_by_valid_sessions = {
+        str(row.get("proxy") or "").strip()
+        for row in db.get_accounts(None)
+        if str(row.get("proxy") or "").strip()
+        and db.session_status(row.get("session_saved_at")) in {"active", "expiring"}
+    }
+    if auth_proxy_pool:
+        retained = len(proxies_retained_by_valid_sessions)
+        suffix = f"; {retained} already retained by authed accounts" if retained else ""
+        log(f"Auth proxy pool loaded — {len(auth_proxy_pool)} available{suffix}.")
+
+    def borrow_auth_proxy() -> str | None:
+        nonlocal proxy_cursor
+        if not auth_proxy_pool:
+            return None
+        with proxy_lock:
+            locked = proxies_retained_by_valid_sessions | proxies_assigned_this_run | proxies_in_flight
+            pool_len = len(auth_proxy_pool)
+            for offset in range(pool_len):
+                idx = (proxy_cursor + offset) % pool_len
+                candidate = auth_proxy_pool[idx]
+                if candidate in locked:
+                    continue
+                proxy_cursor = (idx + 1) % pool_len
+                proxies_in_flight.add(candidate)
+                return candidate
+            candidate = auth_proxy_pool[proxy_cursor % pool_len]
+            proxy_cursor = (proxy_cursor + 1) % pool_len
+            proxies_in_flight.add(candidate)
+            log("Auth proxy pool is fully allocated; reusing a pool proxy for this attempt.", "warning")
+            return candidate
+
+    def finish_auth_proxy(proxy: str | None, *, success: bool) -> None:
+        if not proxy:
+            return
+        with proxy_lock:
+            proxies_in_flight.discard(proxy)
+            if success:
+                proxies_assigned_this_run.add(proxy)
+
     # Promote driver_holder to a multi-driver shape so parallel workers can
     # all be interrupted by a single m_session_stop. We keep the legacy
     # "driver" key working too by leaving it unset here.
@@ -473,12 +523,23 @@ def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder
         def _wlog(msg, level="info"):
             log(f"{prefix}: {msg}", level)
 
+        account_id = int(account["id"])
+        account_has_valid_auth = db.account_has_valid_session(account_id)
+        retained_proxy = str(account.get("proxy") or "").strip() if account_has_valid_auth else ""
+        borrowed_proxy = None if account_has_valid_auth else borrow_auth_proxy()
+        auth_proxy = retained_proxy or borrowed_proxy or account.get("proxy")
+        if borrowed_proxy:
+            _wlog("borrowed auth proxy from pool.")
+        elif retained_proxy:
+            _wlog("retaining existing proxy from active session.")
+
+        success = False
         try:
             result = auth_harvester.login_single_account(
                 phone=local_digits,
                 country_iso=account.get("country_iso") or country_iso,
                 email=(account.get("aycd_email") or account.get("email")),
-                proxy=account.get("proxy"),
+                proxy=auth_proxy,
                 session_dir=_session_dir(),
                 aycd_key=account.get("aycd_key"),
                 imap_email=account.get("imap_email"),
@@ -490,17 +551,26 @@ def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder
             )
             if result.get("ok") and result.get("bearer_token"):
                 try:
-                    db.save_session(int(account["id"]), result["bearer_token"], phone=phone)
+                    db.save_session(account_id, result["bearer_token"], phone=phone)
                 except Exception as exc:
                     _wlog(f"DB save failed: {exc}", "error")
-                _event(sid, type="auth_update", account_id=account["id"], status="ok")
+                if borrowed_proxy:
+                    try:
+                        db.update_account(account_id, proxy=borrowed_proxy)
+                        account["proxy"] = borrowed_proxy
+                        _wlog("assigned auth proxy to account.")
+                    except Exception as exc:
+                        _wlog(f"Failed to persist borrowed proxy: {exc}", "warning")
+                _event(sid, type="auth_update", account_id=account_id, status="ok")
+                success = True
             else:
-                _event(sid, type="auth_update", account_id=account["id"], status="fail",
+                _event(sid, type="auth_update", account_id=account_id, status="fail",
                        error=result.get("error"))
         except Exception as exc:
             _wlog(f"error: {exc}", "error")
-            _event(sid, type="auth_update", account_id=account["id"], status="fail", error=str(exc))
+            _event(sid, type="auth_update", account_id=account_id, status="fail", error=str(exc))
         finally:
+            finish_auth_proxy(borrowed_proxy, success=success)
             _unregister_driver(my_driver["d"])
             with completed_lock:
                 completed["n"] += 1

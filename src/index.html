@@ -326,6 +326,17 @@
         </div>
 
         <div class="panel">
+          <div class="panel-title">Auth proxy pool</div>
+          <div class="form-grid">
+            <label>
+              <span>Proxy pool (one per line)</span>
+              <textarea id="authProxyPool" rows="7" placeholder="host:port:user:pass&#10;user:pass@host:port&#10;http://user:pass@host:port"></textarea>
+            </label>
+            <p class="muted" style="font-size:11px; margin:-6px 0 0;" id="authProxyPoolStatus">0 proxies saved. Unauthenticated accounts borrow from this pool and keep the proxy only after a successful auth.</p>
+          </div>
+        </div>
+
+        <div class="panel">
           <div class="panel-title">Defaults</div>
           <div class="form-grid">
             <label>
