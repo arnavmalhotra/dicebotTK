@@ -16,7 +16,7 @@ import re
 import time
 import uuid
 from base64 import b64encode
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 import requests as plain_requests
 from curl_cffi.requests import Session as CffiSession
@@ -28,6 +28,40 @@ class DiceFM:
     # reCAPTCHA context loaded from recaptcha_context.json (from CapSolver extension)
     _RECAPTCHA_ANCHOR = None
     _RECAPTCHA_RELOAD = None
+
+    @staticmethod
+    def normalize_event_url(event_url: str) -> tuple[str, str]:
+        raw = re.sub(r"\s+", "", str(event_url or "").strip()).strip(" ,")
+        if not raw:
+            raise ValueError("Event URL is required")
+
+        if re.fullmatch(r"[a-f0-9]{24}", raw, flags=re.I):
+            return raw.lower(), f"https://dice.fm/event/{raw.lower()}"
+
+        if "/" not in raw and "." not in raw:
+            slug = raw.strip("/")
+            return slug, f"https://dice.fm/event/{slug}"
+
+        if raw.startswith("//"):
+            raw = "https:" + raw
+        elif not re.match(r"^[a-z][a-z0-9+.-]*://", raw, flags=re.I):
+            raw = "https://" + raw
+
+        parsed = urlsplit(raw)
+        parts = [part for part in parsed.path.split("/") if part]
+        slug = ""
+        for idx, part in enumerate(parts):
+            if part in ("event", "events") and idx + 1 < len(parts):
+                slug = parts[idx + 1]
+                break
+        if not slug and parts and parts[-1] not in ("event", "events"):
+            slug = parts[-1]
+        slug = slug.strip("/")
+
+        if not slug:
+            raise ValueError(f"Invalid DICE event URL: {event_url}")
+
+        return slug, f"https://dice.fm/event/{slug}"
 
     @classmethod
     def _load_recaptcha_context(cls):
@@ -52,6 +86,11 @@ class DiceFM:
         target_min_price: float | None = None,
         target_max_price: float | None = None,
         ticket_tier: str | None = None,
+        ticket_type_id: str | None = None,
+        tier_strategy: str | None = None,
+        tier_keywords: str | list | None = None,
+        allowed_tier_ids: list | tuple | set | None = None,
+        price_rules: list[dict] | None = None,
         session_dir: str | None = None,
         log_fn=None,
     ):
@@ -68,6 +107,44 @@ class DiceFM:
         self.target_min_price = target_min_price
         self.target_max_price = target_max_price
         self.ticket_tier = ticket_tier
+        self.ticketTypePreferenceId = str(ticket_type_id).strip() if ticket_type_id else None
+        normalized_strategy = str(tier_strategy or "").strip().lower().replace("-", "_")
+        if normalized_strategy not in {"cheapest", "most_expensive"}:
+            normalized_strategy = "cheapest"
+        self.tier_strategy = normalized_strategy
+        self.positive_keywords, self.negative_keywords = self._parse_tier_keywords(tier_keywords)
+        self.allowed_tier_ids = {
+            str(x).strip() for x in (allowed_tier_ids or []) if str(x).strip()
+        }
+        self.price_rules = []
+        for item in (price_rules or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                qty = int(item.get("quantity"))
+            except (TypeError, ValueError):
+                qty = 1
+            if qty <= 0:
+                qty = 1
+            rule = {"quantity": qty}
+            raw_min = item.get("min_price")
+            if raw_min not in (None, ""):
+                try:
+                    val = float(raw_min)
+                    if val > 0:
+                        rule["min_price"] = val
+                except (TypeError, ValueError):
+                    pass
+            raw_max = item.get("max_price")
+            if raw_max not in (None, ""):
+                try:
+                    val = float(raw_max)
+                    if val > 0:
+                        rule["max_price"] = val
+                except (TypeError, ValueError):
+                    pass
+            self.price_rules.append(rule)
+        self.selected_quantity: int | None = None
 
         # Browser fingerprint — Chrome 146 on Windows 10
         self.userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
@@ -99,9 +176,7 @@ class DiceFM:
         self.stripeSid = str(uuid.uuid4())
 
         # Parse event slug from URL (strip whitespace that copy-paste can introduce)
-        clean_url = re.sub(r"\s+", "", event_url.strip())
-        self.eventSlug = clean_url.rstrip("/").split("/")[-1]
-        self.eventUrl = clean_url
+        self.eventSlug, self.eventUrl = self.normalize_event_url(event_url)
 
         # State variables (populated during flow)
         self.bearerToken: str | None = None
@@ -119,6 +194,8 @@ class DiceFM:
         self.ticketPrice: float | None = None
         self.ticketCurrency: str | None = None
         self.ticketStatus: str | None = None
+        self.ticketMaxPerOrder: int | None = None
+        self.excludedTierIds: set[str] = set()
         self.purchaseTTL: int = 30
         self.purchaseQuantity: int | None = None
         self.cardLast4: str | None = None
@@ -126,6 +203,8 @@ class DiceFM:
         self.eventDate: str | None = None
         self.eventVenue: str | None = None
         self.eventIsLocked: bool | None = None
+        self.accessCodeClaimed = False
+        self.lastAccessCodeError: str | None = None
         self.minPrice: float | None = None
         self.maxPrice: float | None = None
         self.flowStartTime: float | None = None
@@ -338,21 +417,32 @@ class DiceFM:
     def _session_file_path(self) -> str | None:
         if not self._session_dir:
             return None
-        # Strip + and country prefix to match auth_harvester's format
+        # Match auth_harvester.save_session's format: strip + and leading zeros
+        # (no country-code stripping). Previously this method stripped country
+        # codes, which caused a filename mismatch with what Auth Farm wrote,
+        # making cart runs report "No valid session" even when a session
+        # existed on disk under the full-digit name.
+        digits = self.phone.replace("+", "").lstrip("0")
+        return os.path.join(self._session_dir, f"dice_session_{digits}.json")
+
+    def _legacy_session_file_paths(self) -> list[str]:
+        """Return legacy country-code-stripped paths, for reading sessions
+        written by older builds of dice_requests before the format unified."""
+        if not self._session_dir:
+            return []
         digits = self.phone.replace("+", "")
-        # Strip leading country code: 1 (US), 44 (GB), etc.
+        candidates: list[str] = []
         prefixes = ["44", "49", "33", "31", "61", "34", "39", "91", "81", "82", "86",
-                     "55", "52", "90", "353", "351", "32", "41", "43", "46", "47", "45",
-                     "48", "420", "36", "7"]
+                    "55", "52", "90", "353", "351", "32", "41", "43", "46", "47", "45",
+                    "48", "420", "36", "7"]
         for p in sorted(prefixes, key=len, reverse=True):
             if digits.startswith(p) and len(digits) > len(p) + 5:
-                digits = digits[len(p):]
+                candidates.append(os.path.join(self._session_dir, f"dice_session_{digits[len(p):]}.json"))
                 break
         else:
-            # US: strip leading 1 if 11 digits
             if digits.startswith("1") and len(digits) == 11:
-                digits = digits[1:]
-        return os.path.join(self._session_dir, f"dice_session_{digits}.json")
+                candidates.append(os.path.join(self._session_dir, f"dice_session_{digits[1:]}.json"))
+        return candidates
 
     def save_session(self) -> None:
         if not self.bearerToken:
@@ -372,8 +462,16 @@ class DiceFM:
 
     def load_session(self) -> bool:
         path = self._session_file_path()
-        if not path or not os.path.exists(path):
+        if not path:
             return False
+        if not os.path.exists(path):
+            for legacy in self._legacy_session_file_paths():
+                if os.path.exists(legacy):
+                    self.info(f"Reading legacy session file at {legacy}")
+                    path = legacy
+                    break
+            else:
+                return False
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -413,7 +511,7 @@ class DiceFM:
 
     def visit_event_page(self) -> None:
         self.info("Step 1: Visiting event page...")
-        url = "https://" + self.frontendHost + "/event/" + self.eventSlug
+        url = self.eventUrl
         self.info("URL: " + url)
         headers = {
             "sec-ch-ua": self.secCH,
@@ -451,6 +549,93 @@ class DiceFM:
 
     # ── Fetch ticket types ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _parse_tier_keywords(raw) -> tuple[list[str], list[str]]:
+        """Split a keyword spec into (positive, negative) token lists.
+
+        Accepts a string ("stage vip -parking, -resale") or a list of strings.
+        Tokens prefixed with '-' or '!' are negative; everything else is
+        positive. Tokens are normalized lowercase, whitespace-collapsed.
+        """
+        positive: list[str] = []
+        negative: list[str] = []
+        if raw is None:
+            return positive, negative
+        if isinstance(raw, (list, tuple, set)):
+            tokens = []
+            for item in raw:
+                tokens.extend(str(item or "").replace(",", " ").split())
+        else:
+            tokens = str(raw or "").replace(",", " ").split()
+        for tok in tokens:
+            t = tok.strip()
+            if not t:
+                continue
+            if t.startswith(("-", "!")):
+                term = t[1:].strip().lower()
+                if term:
+                    negative.append(term)
+            else:
+                term = t.strip().lower()
+                if term:
+                    positive.append(term)
+        return positive, negative
+
+    def _candidate_text_blob(self, candidate: dict) -> str:
+        tt = candidate.get("tt", {}) or {}
+        parts = [str(candidate.get("name") or "")]
+        for key in ("description", "price_tier_name", "subtitle"):
+            val = tt.get(key)
+            if isinstance(val, str) and val.strip():
+                parts.append(val)
+        return " ".join(parts).lower()
+
+    def _apply_tier_filters(self, candidates: list[dict]) -> list[dict]:
+        """Filter candidates by positive/negative keywords and min/max price.
+
+        Logs each rejection so it's traceable in cart logs.
+        """
+        allowed_ids = self.allowed_tier_ids or set()
+        # Explicit tier picks override keyword matching: when the user prefetched
+        # and selected specific tier ids, ignore the keyword inputs entirely so
+        # there's no surprise "selected tier was filtered out by a stale keyword."
+        if allowed_ids:
+            positive: list[str] = []
+            negative: list[str] = []
+        else:
+            positive = list(self.positive_keywords or [])
+            negative = list(self.negative_keywords or [])
+        min_price = self.target_min_price
+        max_price = self.target_max_price
+        if not (positive or negative or allowed_ids or min_price is not None or max_price is not None):
+            return candidates
+
+        kept: list[dict] = []
+        for c in candidates:
+            tid = str((c.get("tt") or {}).get("id") or "")
+            if allowed_ids and tid not in allowed_ids:
+                self.info(f"  filtered: '{c['name']}' (id {tid}) not in selected tiers")
+                continue
+            blob = self._candidate_text_blob(c)
+            price = float(c.get("price") or 0)
+            hit_neg = next((n for n in negative if n in blob), None)
+            if hit_neg is not None:
+                self.info(f"  filtered: '{c['name']}' matches negative keyword '{hit_neg}'")
+                continue
+            if positive and not any(p in blob for p in positive):
+                self.info(f"  filtered: '{c['name']}' does not match any positive keyword ({', '.join(positive)})")
+                continue
+            if min_price is not None and price < float(min_price):
+                self.info(f"  filtered: '{c['name']}' priced ${price:.2f} below min ${float(min_price):.2f}")
+                continue
+            if max_price is not None and price > float(max_price):
+                self.info(f"  filtered: '{c['name']}' priced ${price:.2f} above max ${float(max_price):.2f}")
+                continue
+            kept.append(c)
+        if not kept:
+            self.warn("All tiers were filtered out by tier filters (selection / keywords / min / max).")
+        return kept
+
     def fetch_ticket_types(self, authenticated: bool = False) -> dict | None:
         if not self.eventId:
             self.warn("Event ID not set, skipping ticket_types")
@@ -460,6 +645,7 @@ class DiceFM:
         self.ticketTypeId = None
         self.ticketName = None
         self.ticketPrice = None
+        self.ticketMaxPerOrder = None
         label = "authenticated" if authenticated else "unauthenticated"
         self.info(f"Fetching ticket_types ({label})...")
         resp = self._api_get(
@@ -475,6 +661,7 @@ class DiceFM:
         self.eventIsLocked = data.get("is_locked", False)
 
         # Parse all ticket types first
+        excluded = {str(x) for x in (self.excludedTierIds or set())}
         candidates = []
         for tt in ticket_types:
             name = tt.get("name", "?")
@@ -495,50 +682,105 @@ class DiceFM:
             rt = tt.get("reserve_token")
             has_rt = "YES" if rt else "no"
             max_per = tt.get("limits", {}).get("max_increments", "?")
-            self.info(f"  Ticket: {name} | ID: {tid} | Status: {status} | ${price:.2f} {currency} | max: {max_per} | reserve_token: {has_rt}")
+            excluded_marker = " | EXCLUDED (prior failure)" if str(tid) in excluded else ""
+            self.info(f"  Ticket: {name} | ID: {tid} | Status: {status} | ${price:.2f} {currency} | max: {max_per} | reserve_token: {has_rt}{excluded_marker}")
 
-            if rt:
+            if rt and str(tid) not in excluded:
                 candidates.append({"tt": tt, "name": name, "price": price, "currency": currency,
                                     "status": status, "rt": rt})
 
         if not candidates:
             return data
 
-        # Apply price filter
-        if self.target_max_price is not None:
-            candidates = [c for c in candidates if c["price"] <= self.target_max_price]
-        if self.target_min_price is not None:
-            candidates = [c for c in candidates if c["price"] >= self.target_min_price]
-
+        # Apply task-level filters (keywords + min/max price) to narrow the
+        # candidate pool before strategy / fuzzy / preference picks one.
+        candidates = self._apply_tier_filters(candidates)
         if not candidates:
-            self.warn(f"No tickets match price range (max={self.target_max_price})")
             return data
 
-        # Tier selection: fuzzy match if tier is set, else cheapest
-        selected = None
-        if self.ticket_tier:
+        def _fuzzy_matches(candidate, tier_name):
             from difflib import SequenceMatcher
-            tier_lower = self.ticket_tier.lower()
-            # Score each candidate by similarity
-            scored = []
-            for c in candidates:
-                name_lower = c["name"].lower()
-                # Substring match gets perfect score
-                if tier_lower in name_lower:
-                    score = 1.0
-                else:
-                    score = SequenceMatcher(None, tier_lower, name_lower).ratio()
-                scored.append((score, c))
-            scored.sort(key=lambda x: -x[0])
-            if scored[0][0] > 0.3:  # threshold
+            tier_lower = tier_name.lower().strip()
+            if not tier_lower:
+                return 0.0
+            tt = candidate.get("tt", {}) or {}
+            name_lower = candidate["name"].lower()
+            extras = []
+            for key in ("description", "price_tier_name", "subtitle"):
+                val = tt.get(key)
+                if isinstance(val, str) and val.strip():
+                    extras.append(val.lower())
+            blob = " ".join([name_lower, *extras])
+            if tier_lower in blob:
+                return 1.0
+            return SequenceMatcher(None, tier_lower, name_lower).ratio()
+
+        selected = None
+        if self.ticketTypePreferenceId:
+            for candidate in candidates:
+                if str(candidate["tt"].get("id") or "") == self.ticketTypePreferenceId:
+                    selected = candidate
+                    self.info(f"  -> Exact ticket type match: {selected['name']} ({self.ticketTypePreferenceId})")
+                    break
+            else:
+                self.warn(f"No ticket type matches '{self.ticketTypePreferenceId}'")
+                return data
+        elif self.ticket_tier:
+            scored = [(_fuzzy_matches(c, self.ticket_tier), c) for c in candidates]
+            scored.sort(key=lambda x: (-x[0], x[1]["price"]))
+            if scored and scored[0][0] > 0.3:
                 selected = scored[0][1]
                 self.info(f"  -> Fuzzy match for '{self.ticket_tier}': {selected['name']} (score: {scored[0][0]:.2f})")
             else:
                 self.warn(f"No ticket tier matches '{self.ticket_tier}'")
                 return data
         else:
-            # No tier specified — pick the cheapest that matches price filter
-            selected = min(candidates, key=lambda c: c["price"])
+            if self.tier_strategy == "most_expensive":
+                selected = max(candidates, key=lambda c: c["price"])
+                self.info(f"  -> Strategy 'most_expensive': picked {selected['name']} (${selected['price']:.2f})")
+            else:
+                selected = min(candidates, key=lambda c: c["price"])
+                self.info(f"  -> Strategy 'cheapest': picked {selected['name']} (${selected['price']:.2f})")
+
+        def _describe_rule(r):
+            min_p = r.get("min_price")
+            max_p = r.get("max_price")
+            if min_p is not None and max_p is not None:
+                return f"{r.get('quantity', 1)}@${min_p:.2f}-${max_p:.2f}"
+            if max_p is not None:
+                return f"{r.get('quantity', 1)}@<=${max_p:.2f}"
+            if min_p is not None:
+                return f"{r.get('quantity', 1)}@>=${min_p:.2f}"
+            return f"{r.get('quantity', 1)}@any"
+
+        def _rule_matches(r, price):
+            min_p = r.get("min_price")
+            max_p = r.get("max_price")
+            if min_p is not None and price < float(min_p):
+                return False
+            if max_p is not None and price > float(max_p):
+                return False
+            return True
+
+        if self.price_rules:
+            matched_rule = None
+            for idx, rule in enumerate(self.price_rules, start=1):
+                if _rule_matches(rule, selected["price"]):
+                    matched_rule = (idx, rule)
+                    break
+            if matched_rule is None:
+                rules_desc = ", ".join(_describe_rule(r) for r in self.price_rules)
+                self.warn(
+                    f"{selected['name']} priced at ${selected['price']:.2f}; no rule allowed this price "
+                    f"(rules: {rules_desc})"
+                )
+                return data
+            idx, rule = matched_rule
+            self.selected_quantity = rule.get("quantity", 1)
+            self.info(
+                f"  -> Rule #{idx} matched: buy {self.selected_quantity} ({_describe_rule(rule)}) "
+                f"at price ${selected['price']:.2f}"
+            )
 
         self.reserveToken = selected["rt"]
         self.ticketTypeId = selected["tt"].get("id")
@@ -546,6 +788,7 @@ class DiceFM:
         self.ticketPrice = selected["price"]
         self.ticketCurrency = selected["currency"]
         self.ticketStatus = selected["status"]
+        self.ticketMaxPerOrder = int(selected["tt"].get("limits", {}).get("max_increments") or 1)
         self.info(f"  -> SELECTED: {self.ticketName} (${self.ticketPrice:.2f})")
         return data
 
@@ -802,15 +1045,20 @@ class DiceFM:
             {"code": code, "event_id": self.eventId},
             api_ts="2024-03-25",
         )
-        if resp.status_code == 200:
+        if 200 <= resp.status_code < 300:
+            self.accessCodeClaimed = True
+            self.lastAccessCodeError = None
             self.info("Code claimed successfully!")
         else:
             msg = "Unknown"
             try:
                 msg = resp.json().get("message", msg)
             except Exception:
-                pass
-            self.warn(f"Code claim failed: {msg}")
+                msg = (resp.text or msg).strip() or msg
+            if len(msg) > 240:
+                msg = msg[:240] + "…"
+            self.lastAccessCodeError = f"HTTP {resp.status_code}: {msg}"
+            self.warn(f"Code claim failed: {self.lastAccessCodeError}")
         return resp
 
     # ── CAPTCHA solvers ────────────────────────────────────────────────────
@@ -1104,7 +1352,12 @@ class DiceFM:
             return None
         body = {"line_item_attributes": [{"reserve_token": rt, "quantity": quantity}]}
         resp = self._api_post("/purchases", body, api_ts="2022-05-11")
-        data = resp.json()
+        if not resp or resp.status_code != 200:
+            return resp
+        try:
+            data = resp.json()
+        except Exception:
+            return resp
         self.purchaseId = data.get("purchase_id")
         charge = data.get("charge", {})
         self.stripePublishableKey = charge.get("payment_tokens", {}).get("stripe_publishable_key")
@@ -1492,14 +1745,16 @@ class DiceFM:
         except Exception:
             pass
 
-        if self.eventIsLocked:
-            if self.code:
+        if self.code:
+            if not self.accessCodeClaimed:
                 resp = self.claim_code()
-                if resp and resp.status_code == 200:
+                if resp and 200 <= resp.status_code < 300:
                     self.fetch_ticket_types(authenticated=True)
-            else:
-                self.error("Event is locked but no access code provided")
-                return "event_locked"
+                elif self.eventIsLocked:
+                    return "event_locked"
+        elif self.eventIsLocked:
+            self.error("Event is locked but no access code provided")
+            return "event_locked"
 
         if not self.reserveToken:
             self.fetch_ticket_types(authenticated=True)
@@ -1542,9 +1797,47 @@ class DiceFM:
         self.info(f"Starting purchase: {self.ticketName} ${self.ticketPrice} x{quantity}")
         self.info(f"Card: ****{card_number[-4:]}")
 
-        resp = self.create_purchase(quantity=quantity)
-        if not resp or resp.status_code != 200:
-            self.error(f"Purchase creation failed: {resp.text if resp else 'no response'}")
+        max_tier_attempts = 6
+        resp = None
+        for attempt in range(1, max_tier_attempts + 1):
+            # Refresh ticket types every attempt so we always send a fresh
+            # reserve_token. This handles tokens that went stale during a
+            # scheduled-drop wait, and re-picks the next tier after a failure.
+            self.fetch_ticket_types(authenticated=True)
+            if not self.reserveToken:
+                self.error("No tier available with a reserve token")
+                return False
+            quantity = max(1, int(self.selected_quantity or quantity))
+            allowed = max(1, int(self.ticketMaxPerOrder or quantity))
+            if quantity > allowed:
+                self.warn(f"Capping quantity to tier max ({allowed}); rule asked for {quantity}.")
+                quantity = allowed
+            resp = self.create_purchase(quantity=quantity)
+            if resp and resp.status_code == 200 and self.purchaseId:
+                break
+            err_key = ""
+            err_text = ""
+            if resp is not None:
+                err_text = resp.text or ""
+                try:
+                    err_key = (resp.json() or {}).get("key", "") or ""
+                except Exception:
+                    err_key = ""
+            retriable = err_key in {"ticket_type_not_enough_tickets", "ticket_type_sold_out"}
+            if not retriable:
+                self.error(f"Purchase creation failed: {err_text or 'no response'}")
+                return False
+            failed_tier = self.ticketTypeId
+            self.warn(
+                f"Tier '{self.ticketName}' rejected ({err_key}); excluding and trying next tier "
+                f"(attempt {attempt}/{max_tier_attempts})."
+            )
+            if failed_tier:
+                self.excludedTierIds.add(str(failed_tier))
+                if self.ticketTypePreferenceId and str(self.ticketTypePreferenceId) == str(failed_tier):
+                    self.ticketTypePreferenceId = None
+        else:
+            self.error(f"Exhausted tier fallback after {max_tier_attempts} attempts.")
             return False
         time.sleep(0.5)
 

@@ -5,38 +5,105 @@ Protocol (JSONL over stdin/stdout):
     Request:  {"id": <int>, "method": "<ns.method>", "params": {...}}
     Reply:    {"id": <int>, "ok": true, "data": ...}
               {"id": <int>, "ok": false, "error": "..."}
-    Event:    {"type": "log"|"status"|"progress"|"cart_update"|"auth_update"|"task_update",
+    Event:    {"type": "log"|"status"|"progress"|"cart_update"|"auth_update",
                "session_id": "...", ...}
 
-Long-running methods (auth.login_one, cart.run, auth.farm, task.run) spawn a
-background thread and return {"ok": true, "data": {"session_id": "..."}}
-immediately. The thread emits events tagged with that session id and finishes
-with a "done" event.
+Long-running methods (auth.login_one, cart.run, auth.farm, task.run)
+spawn a background thread and return {"ok": true,
+"data": {"session_id": "..."}} immediately. The thread emits events tagged
+with that session id and finishes with a "done" event.
 """
 from __future__ import annotations
 
 import json
 import multiprocessing
 import os
+import queue
+import random
+import requests
+import ssl
 import sys
 import threading
 import time
 import traceback
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 multiprocessing.freeze_support()
 
+# Add this dir to path so side-by-side modules import cleanly from both the
+# source checkout and PyInstaller's bundled one-dir layout.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
+
+
+def _resolve_cert_bundle_path() -> str | None:
+    candidates: list[Path] = []
+
+    if certifi is not None:
+        try:
+            candidates.append(Path(certifi.where()))
+        except Exception:
+            pass
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.extend(
+            [
+                Path(meipass) / "certifi" / "cacert.pem",
+                Path(meipass) / "_internal" / "certifi" / "cacert.pem",
+            ]
+        )
+
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return str(candidate)
+        except OSError:
+            continue
+
+    return None
+
+
+def _configure_tls_trust() -> None:
+    # macOS Python builds (and PyInstaller-frozen apps) don't read the system
+    # keychain, so urllib.urlopen() fails with CERTIFICATE_VERIFY_FAILED when
+    # undetected_chromedriver tries to fetch the driver release manifest.
+    # Point OpenSSL at certifi's bundle so the patcher can resolve roots.
+    cert_path = _resolve_cert_bundle_path()
+    if not cert_path:
+        return
+
+    os.environ.setdefault("SSL_CERT_FILE", cert_path)
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", cert_path)
+    os.environ.setdefault("CURL_CA_BUNDLE", cert_path)
+
+    def _create_verified_context(*args: Any, **kwargs: Any) -> ssl.SSLContext:
+        if "cafile" not in kwargs or not kwargs["cafile"]:
+            kwargs["cafile"] = cert_path
+        return ssl.create_default_context(*args, **kwargs)
+
+    ssl._create_default_https_context = _create_verified_context
+
+
+_configure_tls_trust()
 
 import db
 
 _SESSIONS_LOCK = threading.Lock()
 _SESSIONS: dict[str, dict] = {}
 _STDOUT_LOCK = threading.Lock()
+
+_APPROVAL_TTL_SECONDS = 300
 
 
 def _ts() -> str:
@@ -74,6 +141,8 @@ def _session_dir() -> str:
 
 def m_db_init(_):
     db.init_db()
+    db.clear_proxies_without_valid_session()
+    db.purge_ephemeral_tasks()
     return {"ok": True}
 
 
@@ -118,12 +187,14 @@ def _enrich(row: dict) -> dict:
 
 
 def m_db_get_accounts(params):
+    db.clear_proxies_without_valid_session()
     gid = params.get("group_id")
     rows = db.get_accounts(int(gid) if gid is not None else None)
     return [_enrich(r) for r in rows]
 
 
 def m_db_get_account(params):
+    db.clear_proxies_without_valid_session()
     row = db.get_account(int(params["account_id"]))
     return _enrich(row) if row else None
 
@@ -131,12 +202,16 @@ def m_db_get_account(params):
 def m_db_add_account(params):
     fields = _normalize_account_fields(params)
     fields.setdefault("name", fields.get("email") or fields.get("phone") or "unnamed")
+    fields["proxy"] = ""
     return {"id": db.add_account(**fields)}
 
 
 def m_db_update_account(params):
     aid = int(params.pop("account_id"))
-    db.update_account(aid, **_normalize_account_fields(params))
+    fields = _normalize_account_fields(params)
+    if "proxy" in fields and not db.account_has_valid_session(aid):
+        fields["proxy"] = ""
+    db.update_account(aid, **fields)
     return {"ok": True}
 
 
@@ -151,31 +226,157 @@ def m_db_assign_group(params):
     return {"ok": True}
 
 
-def m_db_import_file(params):
-    gid = params.get("group_id")
-    result = db.import_file(params["file_path"], int(gid) if gid is not None else None)
-    # result is already {count, created, updated, skipped, log}
-    return result
+# ── Payment cards (DiceBotNew-style: labeled cards assigned to accounts) ──
+
+_CARD_PARAM_ALIASES = {
+    "exp_month": "card_exp_month",
+    "exp_year": "card_exp_year",
+    "cvc": "card_cvv",
+    "cvv": "card_cvv",
+}
 
 
-def m_db_import_tasks_file(params):
-    return db.import_tasks_file(params["file_path"])
+def _normalize_card_fields(params: dict) -> dict:
+    out = {}
+    for k, v in params.items():
+        if k in {"card_id", "account_id"}:
+            continue
+        out[_CARD_PARAM_ALIASES.get(k, k)] = v
+    return out
 
 
-def m_db_get_inventory(_):
-    return db.get_inventory_items()
+def m_db_get_payment_pools(_):
+    return db.get_payment_pools()
 
 
-def m_db_delete_inventory_item(params):
-    db.delete_inventory_item(int(params["item_id"]))
+def m_db_create_payment_pool(params):
+    pid = db.create_payment_pool(params["name"])
+    return {"id": pid}
+
+
+def m_db_rename_payment_pool(params):
+    db.rename_payment_pool(int(params["pool_id"]), params["name"])
     return {"ok": True}
 
 
+def m_db_delete_payment_pool(params):
+    db.delete_payment_pool(int(params["pool_id"]))
+    return {"ok": True}
+
+
+def m_db_get_payment_cards(_):
+    return db.get_payment_cards()
+
+
+def m_db_get_payment_card(params):
+    return db.get_payment_card(int(params["card_id"]))
+
+
+def m_db_add_payment_card(params):
+    fields = _normalize_card_fields(params)
+    cid = db.add_payment_card(**fields)
+    return {"id": cid}
+
+
+def m_db_update_payment_card(params):
+    fields = _normalize_card_fields(params)
+    db.update_payment_card(int(params["card_id"]), **fields)
+    return {"ok": True}
+
+
+def m_db_delete_payment_card(params):
+    db.delete_payment_card(int(params["card_id"]))
+    return {"ok": True}
+
+
+def m_db_assign_card(params):
+    db.assign_card(int(params["account_id"]), int(params["card_id"]))
+    return {"ok": True}
+
+
+def m_db_unassign_card(params):
+    db.unassign_card(int(params["account_id"]), int(params["card_id"]))
+    return {"ok": True}
+
+
+def m_db_get_card_labels(_):
+    return db.get_card_labels()
+
+
+def m_db_get_assigned_cards_for_account(params):
+    return db.get_assigned_cards_for_account(int(params["account_id"]))
+
+
+def m_db_bulk_account_cards_by_label(params):
+    ids = [int(x) for x in (params.get("account_ids") or [])]
+    return db.bulk_account_cards_by_label(ids, params.get("label") or "")
+
+
+def m_db_bulk_add_payment_cards(params):
+    return db.bulk_add_payment_cards(params.get("rows") or [])
+
+
+def m_db_get_code_pools(_):
+    return db.get_code_pools()
+
+
+def m_db_create_code_pool(params):
+    pid = db.create_code_pool(params["name"])
+    return {"id": pid}
+
+
+def m_db_rename_code_pool(params):
+    db.rename_code_pool(int(params["pool_id"]), params["name"])
+    return {"ok": True}
+
+
+def m_db_delete_code_pool(params):
+    db.delete_code_pool(int(params["pool_id"]))
+    return {"ok": True}
+
+
+def m_db_get_code_pool_codes(params):
+    return db.get_code_pool_codes(int(params["pool_id"]))
+
+
+def m_db_add_code_pool_codes(params):
+    return db.add_code_pool_codes(
+        int(params["pool_id"]),
+        params.get("codes") or [],
+    )
+
+
+def m_db_delete_code_pool_code(params):
+    db.delete_code_pool_code(int(params["code_id"]))
+    return {"ok": True}
+
+
+def m_db_clear_code_pool(params):
+    db.clear_code_pool(int(params["pool_id"]))
+    return {"ok": True}
+
+
+def m_db_draw_codes_from_pool(params):
+    return db.draw_codes_from_pool(
+        int(params["pool_id"]),
+        int(params.get("count") or 0),
+    )
+
+
+def m_db_import_file(params):
+    gid = params.get("group_id")
+    count = db.import_file(params["file_path"], int(gid) if gid is not None else None)
+    db.clear_proxies_without_valid_session()
+    return {"count": count}
+
+
 def m_db_get_stats(_):
+    db.clear_proxies_without_valid_session()
     return db.get_stats()
 
 
 def m_db_get_accounts_needing_auth(_):
+    db.clear_proxies_without_valid_session()
     return db.get_accounts_needing_auth()
 
 
@@ -188,59 +389,90 @@ def m_db_get_session(params):
     return db.get_session(int(params["account_id"]))
 
 
-# ── Tasks ──────────────────────────────────────────────────────────────────
+def m_db_get_inventory_items(_):
+    return db.get_inventory_items()
 
-def _enrich_task(row: dict) -> dict:
-    saved = row.get("session_saved_at")
-    row["session_status"] = db.session_status(saved)
-    return row
 
+def m_db_delete_inventory_item(params):
+    db.delete_inventory_item(int(params["item_id"]))
+    return {"ok": True}
+
+
+# ── Tasks (persistent + ephemeral) ─────────────────────────────────────────
 
 def m_db_get_tasks(_):
-    return [_enrich_task(r) for r in db.get_tasks()]
+    return db.get_tasks()
 
 
 def m_db_get_task(params):
-    row = db.get_task(int(params["task_id"]))
-    return _enrich_task(row) if row else None
+    return db.get_task(int(params["task_id"]))
 
 
-def _task_fields(params: dict) -> dict:
-    def _num(v):
-        if v in ("", None):
-            return None
-        try:
-            return float(v)
-        except Exception:
-            return None
+def _task_fields_from_params(params: dict) -> dict:
     return {
         "event_url": (params.get("event_url") or "").strip(),
-        "min_price": _num(params.get("min_price")),
-        "max_price": _num(params.get("max_price")),
-        "presale_code": (params.get("presale_code") or "").strip(),
-        "ticket_tier": (params.get("ticket_tier") or "").strip(),
+        "min_price": _optional_float(params.get("min_price") or params.get("target_min_price")),
+        "max_price": _optional_float(params.get("max_price") or params.get("target_max_price")),
+        "presale_code": params.get("presale_code") or "",
+        "ticket_tier": params.get("ticket_tier") or "",
         "quantity": int(params.get("quantity") or 1),
-        "mode": (params.get("mode") or "auto").strip() or "auto",
-        "scheduled_at": (params.get("scheduled_at") or "").strip(),
-        "scheduled_tz": (params.get("scheduled_tz") or "").strip(),
+        "mode": params.get("mode") or "auto",
+        "scheduled_at": params.get("scheduled_at") or "",
+        "scheduled_tz": params.get("scheduled_tz") or "",
+        "ephemeral": bool(params.get("ephemeral")),
     }
 
 
 def m_db_create_task(params):
-    aid = int(params["account_id"])
-    tid = db.create_task(aid, **_task_fields(params))
-    return {"id": tid}
+    fields = _task_fields_from_params(params)
+    tid = db.create_task(account_id=int(params["account_id"]), **fields)
+    return db.get_task(tid)
 
 
 def m_db_update_task(params):
     tid = int(params["task_id"])
-    db.update_task(tid, **_task_fields(params))
-    return {"ok": True}
+    db.update_task(tid, **_task_fields_from_params(params))
+    return db.get_task(tid)
 
 
 def m_db_delete_task(params):
     db.delete_task(int(params["task_id"]))
     return {"ok": True}
+
+
+def m_db_import_tasks_file(params):
+    return db.import_tasks_file(str(params["file_path"]))
+
+
+def _optional_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_price_rules(raw):
+    rules = []
+    for item in (raw or []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            quantity = int(item.get("quantity"))
+        except (TypeError, ValueError):
+            quantity = 1
+        if quantity <= 0:
+            quantity = 1
+        rule = {"quantity": quantity}
+        min_price = _optional_float(item.get("min_price"))
+        if min_price is not None and min_price > 0:
+            rule["min_price"] = min_price
+        max_price = _optional_float(item.get("max_price"))
+        if max_price is not None and max_price > 0:
+            rule["max_price"] = max_price
+        rules.append(rule)
+    return rules
 
 
 # ── Background-task helpers ────────────────────────────────────────────────
@@ -250,7 +482,7 @@ def _start_session(kind: str, runner, params) -> str:
     stop_evt = threading.Event()
     approve_evt = threading.Event()
     otp_holder = {"code": None}
-    driver_holder: dict = {"driver": None}
+    driver_holder: dict = {"driver": None, "drivers": [], "lock": threading.Lock()}
 
     with _SESSIONS_LOCK:
         _SESSIONS[sid] = {
@@ -259,7 +491,6 @@ def _start_session(kind: str, runner, params) -> str:
             "approve": approve_evt,
             "otp": otp_holder,
             "driver_holder": driver_holder,
-            "meta": {},
         }
 
     def _wrap():
@@ -276,6 +507,48 @@ def _start_session(kind: str, runner, params) -> str:
     return sid
 
 
+def _register_driver(driver_holder: dict, driver) -> None:
+    if driver is None:
+        return
+    lock = driver_holder.get("lock")
+    if lock is None:
+        driver_holder["driver"] = driver
+        return
+    with lock:
+        drivers = driver_holder.setdefault("drivers", [])
+        if all(existing is not driver for existing in drivers):
+            drivers.append(driver)
+        driver_holder["driver"] = driver
+
+
+def _unregister_driver(driver_holder: dict, driver) -> None:
+    if driver is None:
+        return
+    lock = driver_holder.get("lock")
+    if lock is None:
+        if driver_holder.get("driver") is driver:
+            driver_holder["driver"] = None
+        return
+    with lock:
+        drivers = [existing for existing in (driver_holder.get("drivers") or []) if existing is not driver]
+        driver_holder["drivers"] = drivers
+        if driver_holder.get("driver") is driver:
+            driver_holder["driver"] = drivers[-1] if drivers else None
+
+
+def _snapshot_drivers(driver_holder: dict) -> list:
+    lock = driver_holder.get("lock")
+    if lock is None:
+        driver = driver_holder.get("driver")
+        return [driver] if driver is not None else []
+    with lock:
+        drivers = list(driver_holder.get("drivers") or [])
+        current = driver_holder.get("driver")
+        if current is not None and all(existing is not current for existing in drivers):
+            drivers.append(current)
+        return drivers
+
+
 def _log_fn_for(sid: str):
     def log(msg: str, level: str = "info"):
         _event(sid, type="log", level=level, message=msg)
@@ -283,99 +556,405 @@ def _log_fn_for(sid: str):
 
 
 def _parse_scheduled_ts(scheduled_at: str, scheduled_tz: str) -> float | None:
-    """Parse "YYYY-MM-DDTHH:MM[:SS]" + IANA tz → unix seconds, or None."""
-    s = (scheduled_at or "").strip()
-    if not s:
+    """Parse "YYYY-MM-DDTHH:MM[:SS]" plus an IANA tz into unix seconds."""
+    raw = (scheduled_at or "").strip()
+    if not raw:
         return None
-    # datetime-local inputs give "YYYY-MM-DDTHH:MM" with no seconds.
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
         try:
-            naive = datetime.strptime(s, fmt)
+            naive = datetime.strptime(raw, fmt)
             break
         except ValueError:
             naive = None
     if naive is None:
         return None
-    tz = scheduled_tz.strip() or "UTC"
+    tz_name = (scheduled_tz or "").strip() or "UTC"
     try:
-        zone = ZoneInfo(tz)
+        zone = ZoneInfo(tz_name)
     except Exception:
-        zone = ZoneInfo("UTC")
+        try:
+            zone = ZoneInfo("UTC")
+        except Exception:
+            zone = UTC
     return naive.replace(tzinfo=zone).timestamp()
 
 
-def _wait_and_poll_for_drop(client, target_ts: float, stop_evt: threading.Event, log) -> bool:
-    """Block until a reserve_token appears, anchored around target_ts.
+def _approval_config(params: dict) -> dict:
+    return {
+        "webhook_url": str(params.get("approval_webhook_url") or "").strip(),
+        "poll_url": str(params.get("approval_poll_url") or "").strip(),
+        "secret": str(params.get("approval_secret") or "").strip(),
+        "poll_interval_seconds": max(1.0, min(15.0, float(params.get("approval_poll_interval_seconds") or 2))),
+    }
 
-    reserve_token = eligibility to cart, not a ticket hold. First POST to
-    /purchases wins, so we fire as soon as the API will accept one.
 
-    - Interruptible sleep until T-3s (don't hammer the API early).
-    - From T-3s: polls fetch_ticket_types every ~80ms and fires the moment
-      a reserve_token appears (before, at, or after T=0).
-    - After T=0: keeps polling for up to POST_DROP_GRACE seconds if tiers
-      haven't been published yet.
+def _approval_headers(secret: str) -> dict:
+    headers = {
+        "User-Agent": "DiceBotTK/approval-bridge",
+        "Accept": "application/json",
+    }
+    if secret:
+        headers["Authorization"] = f"Bearer {secret}"
+    return headers
 
-    Returns True if a reserve_token was obtained, False otherwise.
-    """
-    PRE_DROP_INTERVAL = 0.08
-    POST_DROP_INTERVAL = 0.08
-    POST_DROP_GRACE = 30.0
 
-    # ── 1. Interruptible sleep until T-3s ────────────────────────────────
-    while True:
-        remaining = target_ts - time.time()
-        if remaining <= 3.0:
+def _build_approval_payload(
+    sid: str,
+    account: dict,
+    client,
+    params: dict,
+    approval_id: str,
+    expires_at_iso: str,
+    expires_in_seconds: int,
+) -> dict:
+    source = str(params.get("approval_source") or params.get("source") or "dashboard_cart")
+    monitor_id = params.get("monitor_id")
+    monitor_name = params.get("monitor_name")
+    quantity = int(params.get("quantity") or 1)
+    unit_price = float(client.ticketPrice or 0)
+
+    return {
+        "event": "checkout.approval_requested",
+        "version": "2026-04-19.1",
+        "delivery_id": str(uuid.uuid4()),
+        "sent_at": _ts(),
+        "approval": {
+            "approval_id": approval_id,
+            "session_id": sid,
+            "status": "pending",
+            "expires_at": expires_at_iso,
+            "expires_in_seconds": expires_in_seconds,
+        },
+        "context": {
+            "source": source,
+            "monitor_id": int(monitor_id) if monitor_id not in (None, "") else None,
+            "monitor_name": monitor_name or None,
+            "scheduled_at": params.get("scheduled_at") or None,
+            "scheduled_tz": params.get("scheduled_tz") or None,
+        },
+        "account": {
+            "id": int(account.get("id") or 0) or None,
+            "name": account.get("name") or "",
+            "phone": account.get("phone") or "",
+            "email": account.get("email") or "",
+        },
+        "event_data": {
+            "url": client.eventUrl or params.get("event_url") or "",
+            "name": client.eventName or "",
+            "date": client.eventDate or "",
+            "venue": client.eventVenue or "",
+        },
+        "ticket": {
+            "ticket_type_id": str(client.ticketTypeId or params.get("ticket_type_id") or ""),
+            "tier_name": client.ticketName or params.get("ticket_tier") or "",
+            "unit_price": unit_price,
+            "currency": client.ticketCurrency or "USD",
+            "quantity": quantity,
+            "estimated_subtotal": unit_price * quantity,
+        },
+    }
+
+
+def _post_approval_request(config: dict, payload: dict, log) -> tuple[bool, str]:
+    if not config["webhook_url"]:
+        return False, "Approval webhook URL is not configured"
+    try:
+        resp = requests.post(
+            config["webhook_url"],
+            json=payload,
+            headers={
+                **_approval_headers(config["secret"]),
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+    except Exception as exc:
+        return False, str(exc)
+    if 200 <= resp.status_code < 300:
+        return True, ""
+    body = (resp.text or "").strip()
+    if len(body) > 240:
+        body = body[:240] + "…"
+    return False, f"HTTP {resp.status_code}{f': {body}' if body else ''}"
+
+
+def _poll_approval_status(config: dict, approval_id: str, sid: str, log) -> tuple[str, dict | None, str | None]:
+    if not config["poll_url"]:
+        return "pending", None, None
+    try:
+        resp = requests.get(
+            config["poll_url"],
+            params={"approval_id": approval_id, "session_id": sid},
+            headers=_approval_headers(config["secret"]),
+            timeout=10,
+        )
+    except Exception as exc:
+        return "pending", None, str(exc)
+
+    if resp.status_code == 404:
+        return "pending", None, None
+    if not (200 <= resp.status_code < 300):
+        return "pending", None, f"HTTP {resp.status_code}"
+
+    try:
+        payload = resp.json() if resp.content else {}
+    except Exception as exc:
+        return "pending", None, f"Invalid JSON: {exc}"
+
+    status = str(payload.get("status") or "pending").strip().lower()
+    if status not in {"pending", "approved", "declined"}:
+        status = "pending"
+    return status, payload, None
+
+
+def _wait_for_checkout_approval(
+    sid: str,
+    account: dict,
+    client,
+    params: dict,
+    requested_quantity: int,
+    final_quantity: int,
+    quantity_warning: str,
+    stop_evt: threading.Event,
+    approve_evt: threading.Event,
+    emit_update,
+    log,
+) -> tuple[bool, str | None]:
+    config = _approval_config(params)
+    remote_enabled = bool(config["webhook_url"] and config["poll_url"])
+    approval_id = f"apr_{uuid.uuid4().hex[:26]}"
+    expires_at = datetime.now(UTC) + timedelta(seconds=_APPROVAL_TTL_SECONDS)
+    expires_at_iso = expires_at.isoformat().replace("+00:00", "Z")
+
+    emit_update(
+        status="reserved",
+        ticket_name=client.ticketName,
+        ticket_price=client.ticketPrice,
+        ticket_currency=client.ticketCurrency,
+        event_name=client.eventName,
+        ttl=_APPROVAL_TTL_SECONDS,
+        quantity=final_quantity,
+        total_price=(float(client.ticketPrice or 0) * final_quantity),
+        requested_quantity=requested_quantity,
+        quantity_warning=quantity_warning,
+        approval_id=approval_id,
+        approval_channel="webhook" if remote_enabled else "local",
+        approval_expires_at=expires_at_iso,
+    )
+    _event(sid, type="await_approval", approval_id=approval_id)
+
+    if remote_enabled:
+        payload = _build_approval_payload(
+            sid=sid,
+            account=account,
+            client=client,
+            params=params,
+            approval_id=approval_id,
+            expires_at_iso=expires_at_iso,
+            expires_in_seconds=_APPROVAL_TTL_SECONDS,
+        )
+        sent_ok, send_error = _post_approval_request(config, payload, log)
+        if sent_ok:
+            log(f"Approval webhook sent ({approval_id}).")
+        else:
+            log(f"Approval webhook failed ({approval_id}): {send_error}", "warning")
+            emit_update(
+                status="reserved",
+                approval_id=approval_id,
+                approval_channel="webhook",
+                approval_error=send_error,
+            )
+
+    deadline = time.time() + _APPROVAL_TTL_SECONDS
+    next_poll_at = 0.0
+    last_poll_error = None
+
+    while not stop_evt.is_set():
+        remaining = deadline - time.time()
+        if remaining <= 0:
             break
-        if stop_evt.wait(timeout=min(remaining - 3.0, 1.0)):
+
+        if approve_evt.wait(timeout=min(0.5, remaining)):
+            if remote_enabled:
+                log(f"Checkout approved locally while webhook approval was active ({approval_id}).")
+            return True, None
+
+        if remote_enabled and time.time() >= next_poll_at:
+            next_poll_at = time.time() + config["poll_interval_seconds"]
+            status, payload, poll_error = _poll_approval_status(config, approval_id, sid, log)
+            if poll_error and poll_error != last_poll_error:
+                last_poll_error = poll_error
+                log(f"Approval poll issue ({approval_id}): {poll_error}", "warning")
+            if status == "approved":
+                actor = ((payload or {}).get("actor") or {}).get("name") or ((payload or {}).get("actor") or {}).get("id") or "remote reviewer"
+                log(f"Webhook approval received from {actor} ({approval_id}).")
+                return True, None
+            if status == "declined":
+                actor = ((payload or {}).get("actor") or {}).get("name") or ((payload or {}).get("actor") or {}).get("id") or "remote reviewer"
+                note = (payload or {}).get("note") or ""
+                emit_update(status="declined", approval_id=approval_id)
+                return False, f"Webhook approval declined by {actor}{f' — {note}' if note else ''}"
+
+    if stop_evt.is_set():
+        return False, "stopped"
+    return False, "Approval timeout — ticket released"
+
+
+def _cart_response_error(resp) -> str:
+    if resp is None:
+        return "no response"
+    try:
+        payload = resp.json() if resp.content else {}
+        body = (
+            payload.get("message")
+            or payload.get("error")
+            or payload.get("detail")
+            or ""
+        )
+    except Exception:
+        body = (resp.text or "").strip()
+    if len(body) > 240:
+        body = body[:240] + "…"
+    return f"HTTP {resp.status_code}{f': {body}' if body else ''}"
+
+
+def _claim_cart_access_code(client, log) -> tuple[bool, str]:
+    if not getattr(client, "code", ""):
+        return False, "no access code provided"
+    if getattr(client, "accessCodeClaimed", False):
+        return True, ""
+    try:
+        resp = client.claim_code()
+    except Exception as exc:
+        return False, str(exc)
+    if resp is not None and 200 <= resp.status_code < 300:
+        return True, ""
+    return False, _cart_response_error(resp)
+
+
+_PRE_DROP_FIRE_WINDOW = 240.0  # default fire-window length when enabled
+
+
+def _wait_and_poll_for_drop(
+    client,
+    target_ts: float,
+    stop_evt: threading.Event,
+    log,
+    fire_window_seconds: float = _PRE_DROP_FIRE_WINDOW,
+) -> bool:
+    """Wait until a reserve token can be fired.
+
+    Behavior: hold (do not fire) until we are within `fire_window_seconds`
+    of the scheduled drop. Once inside the window, fire as soon as a fresh
+    reserve_token is available — including a re-fetch right at fire time so
+    we avoid stale tokens that Dice may have invalidated during the wait.
+
+    With `fire_window_seconds=0`, behavior is strict: hold until exactly the
+    scheduled drop instant, then refresh and fire.
+    """
+    poll_interval = 0.08
+    pre_window_poll_interval = 1.0
+    post_drop_grace = 30.0
+    code_claim_interval = 0.5
+    last_code_claim = 0.0
+    fire_window_seconds = max(0.0, float(fire_window_seconds or 0.0))
+    fire_window_start = target_ts - fire_window_seconds
+
+    def maybe_claim_code() -> bool:
+        nonlocal last_code_claim
+        if not getattr(client, "code", "") or getattr(client, "accessCodeClaimed", False):
+            return True
+        now = time.time()
+        if now < target_ts:
+            return False
+        if now - last_code_claim < code_claim_interval:
+            return False
+        last_code_claim = now
+        ok, error = _claim_cart_access_code(client, log)
+        if ok:
+            log("Access code claimed; polling unlocked ticket tiers.")
+        else:
+            log(f"Access code claim not accepted yet: {error}", "warning")
+        return ok
+
+    # Phase 1: before fire window opens. Hold any token, poll lightly for one
+    # if missing (so we're armed when the window opens).
+    held_logged = False
+    while time.time() < fire_window_start:
+        if stop_evt.is_set():
+            return False
+        if client.reserveToken:
+            if not held_logged:
+                if fire_window_seconds > 0:
+                    log(
+                        f"reserve_token held — waiting for fire window "
+                        f"(opens at T-{fire_window_seconds:.0f}s, "
+                        f"in {fire_window_start - time.time():.0f}s)."
+                    )
+                else:
+                    log(
+                        f"reserve_token held — waiting for scheduled drop "
+                        f"(in {target_ts - time.time():.0f}s)."
+                    )
+                held_logged = True
+            remaining = fire_window_start - time.time()
+            if remaining <= 0:
+                break
+            if stop_evt.wait(timeout=min(remaining, pre_window_poll_interval)):
+                return False
+            continue
+        try:
+            client.fetch_ticket_types(authenticated=True)
+            if client.reserveToken and not held_logged:
+                log(
+                    f"reserve_token acquired early — holding for fire window "
+                    f"(opens in {max(0.0, fire_window_start - time.time()):.0f}s)."
+                )
+                held_logged = True
+        except Exception as exc:
+            log(f"Pre-window poll error: {exc}", "warning")
+        if stop_evt.wait(timeout=pre_window_poll_interval):
             return False
 
-    log(f"T-3s — polling for reserve_token; will fire as soon as one appears.")
-
-    # ── 2. Tight poll loop. Fire early if tiers publish before T=0;
-    #       keep going through T=0 and into the post-drop grace window. ─
-    deadline = target_ts + POST_DROP_GRACE
-    interval = PRE_DROP_INTERVAL
-    announced_t0 = False
+    # Phase 2: inside the fire window — fire the moment we have a fresh token.
+    log(
+        f"Fire window open (T-{max(0.0, target_ts - time.time()):.0f}s) — "
+        "refreshing tier state and firing as soon as a reserve_token is available."
+    )
+    deadline = target_ts + post_drop_grace
     while time.time() < deadline:
         if stop_evt.is_set():
             return False
         try:
+            if getattr(client, "code", "") and time.time() >= target_ts and not maybe_claim_code():
+                if stop_evt.wait(timeout=poll_interval):
+                    return False
+                continue
             client.fetch_ticket_types(authenticated=True)
+            if client.reserveToken:
+                log("Fresh reserve_token — firing.")
+                return True
         except Exception as exc:
-            log(f"Poll error: {exc}", "warn")
-        if getattr(client, "reserveToken", None):
-            delta = time.time() - target_ts
-            if delta < 0:
-                log(f"Reserve token obtained T{delta:.2f}s (before drop) — firing.")
-            else:
-                log(f"Reserve token obtained T+{delta:.2f}s (after drop) — firing.")
-            return True
-        if not announced_t0 and time.time() >= target_ts:
-            log("T-0 — no reserve_token yet, continuing to poll.")
-            announced_t0 = True
-            interval = POST_DROP_INTERVAL
-        time.sleep(interval)
+            log(f"Fire-window poll error: {exc}", "warning")
+        if stop_evt.wait(timeout=poll_interval):
+            return False
 
     return False
 
 
-_COUNTRY_PREFIXES = {
-    "44": "gb", "49": "de", "33": "fr", "31": "nl", "61": "au", "91": "in",
-    "34": "es", "39": "it", "353": "ie", "52": "mx", "55": "br",
-}
-
-
 def _split_phone(phone: str) -> tuple[str, str]:
-    """Return (country_iso, local_digits) — dice.fm expects local digits only."""
+    """Return (country_iso, local_digits) — dice.fm expects local digits only.
+
+    Every number is assumed to be US. Strips a leading "1" for the
+    11-digit US format (e.g. 14155551234 → 4155551234).
+    """
     import re
-    digits = re.sub(r"\D", "", phone or "")
-    if (phone or "").startswith("+"):
-        for prefix in sorted(_COUNTRY_PREFIXES, key=len, reverse=True):
-            if digits.startswith(prefix) and len(digits) > len(prefix) + 5:
-                return _COUNTRY_PREFIXES[prefix], digits[len(prefix):]
-        if digits.startswith("1") and len(digits) == 11:
-            return "us", digits[1:]
+    raw_phone = str(phone or "").strip()
+    if re.fullmatch(r"\+?\d+\.0+", raw_phone):
+        raw_phone = raw_phone.split(".", 1)[0]
+    digits = re.sub(r"\D", "", raw_phone)
+    if digits.startswith("1") and len(digits) == 11:
+        return "us", digits[1:]
     return "us", digits
 
 
@@ -385,24 +964,45 @@ def _run_login_one(sid: str, params: dict, stop_evt: threading.Event, otp_holder
     import auth_harvester
 
     account = params["account"]
+    keep_open = bool(params.get("keep_open"))
+    manual_phone = bool(params.get("manual_phone"))
     log = _log_fn_for(sid)
-    _event(sid, type="status", status="starting")
+    _event(sid, type="status", status="starting", manual=manual_phone)
     country_iso, local_digits = _split_phone(account.get("phone") or "")
+    local_driver_ref = {"driver": None}
+
+    def _otp_getter():
+        code = otp_holder.get("code")
+        if code:
+            otp_holder["code"] = None
+        return code
+
+    def _otp_notifier(**kwargs):
+        _event(sid, type="await_otp", account_id=account.get("id"), **kwargs)
 
     result = auth_harvester.login_single_account(
         phone=local_digits,
         country_iso=account.get("country_iso") or country_iso,
-        email=(account.get("aycd_email") or account.get("email")),
+        email=account.get("email"),
         proxy=account.get("proxy"),
         session_dir=_session_dir(),
         aycd_key=account.get("aycd_key"),
-        imap_email=account.get("imap_email"),
+        imap_email=account.get("imap_email") or account.get("email"),
         imap_password=account.get("imap_password"),
-        imap_host=account.get("imap_host") or "imap.gmail.com",
-        imap_recipient=account.get("email") or "",
+        imap_host="imap.gmail.com",
+        session_phone=account.get("phone") or local_digits,
         log_fn=log,
-        on_driver=lambda d: driver_holder.update(driver=d),
+        on_driver=lambda d: (
+            local_driver_ref.update(driver=d),
+            _register_driver(driver_holder, d),
+        ),
+        keep_open_on_success=keep_open,
+        manual_phone=manual_phone,
+        manual_otp_getter=_otp_getter,
+        manual_otp_notifier=_otp_notifier,
     )
+    if not keep_open:
+        _unregister_driver(driver_holder, local_driver_ref.get("driver"))
 
     if result.get("ok") and result.get("bearer_token"):
         try:
@@ -416,29 +1016,162 @@ def _run_login_one(sid: str, params: dict, stop_evt: threading.Event, otp_holder
         _event(sid, type="done", ok=False, error=result.get("error") or "Login failed")
 
 
+def _require_license() -> None:
+    # No-op in TK — licensing is not enforced. Call sites kept to mirror CLI
+    # for low-friction future syncs.
+    pass
+
+
 def m_auth_login_one(params):
+    _require_license()
     sid = _start_session("auth_one", _run_login_one, params)
     return {"session_id": sid}
 
 
+def m_auth_open_profile(params):
+    _require_license()
+    sid = _start_session("auth_open_profile", _run_login_one, {**params, "keep_open": True})
+    return {"session_id": sid}
+
+
+def m_auth_manual_login_one(params):
+    _require_license()
+    sid = _start_session("auth_manual_one", _run_login_one, {**params, "manual_phone": True})
+    return {"session_id": sid}
+
+
+def _run_auth_state_refresh(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dict, driver_holder: dict, approve_evt: threading.Event):
+    import dice_requests
+
+    accounts = list(params.get("accounts") or [])
+    total = len(accounts)
+    log = _log_fn_for(sid)
+
+    if not total:
+        log("No cached sessions to validate.")
+        _event(sid, type="done", ok=True, total=0, valid=0, revoked=0, skipped=0)
+        return
+
+    log(f"Refreshing auth state for {total} cached session{'s' if total != 1 else ''}.")
+    valid = 0
+    revoked = 0
+    skipped = 0
+
+    for idx, account in enumerate(accounts, start=1):
+        if stop_evt.is_set():
+            _event(
+                sid,
+                type="done",
+                ok=False,
+                error="stopped",
+                total=total,
+                valid=valid,
+                revoked=revoked,
+                skipped=skipped,
+            )
+            return
+
+        account_id = int(account.get("id") or 0)
+        phone_label = str(account.get("phone") or account.get("email") or f"Account {idx}")
+        _event(
+            sid,
+            type="auth_state_update",
+            account_id=account_id,
+            status="checking",
+            checked=idx - 1,
+            total=total,
+            valid=valid,
+            revoked=revoked,
+            skipped=skipped,
+        )
+
+        def account_log(msg: str, level: str = "info", prefix=f"[{idx}/{total}] {phone_label}: "):
+            log(prefix + msg, level)
+
+        client = dice_requests.DiceFM(
+            phone=account.get("phone") or "",
+            email=account.get("email") or "",
+            event_url="https://dice.fm/event/refresh-auth-state",
+            proxy_string=account.get("proxy"),
+            session_dir=_session_dir(),
+            log_fn=account_log,
+        )
+
+        if _load_cart_session(client, account, account_log):
+            valid += 1
+            log(f"[{idx}/{total}] {phone_label}: session valid.")
+            _event(
+                sid,
+                type="auth_state_update",
+                account_id=account_id,
+                status="ok",
+                checked=idx,
+                total=total,
+                valid=valid,
+                revoked=revoked,
+                skipped=skipped,
+            )
+            continue
+
+        remaining = db.get_session(account_id) if account_id else None
+        if remaining is None:
+            revoked += 1
+            log(f"[{idx}/{total}] {phone_label}: session revoked or expired; re-auth required.", "warning")
+            status = "invalid"
+        else:
+            skipped += 1
+            log(f"[{idx}/{total}] {phone_label}: could not verify live session; cached state left unchanged.", "warning")
+            status = "skipped"
+
+        _event(
+            sid,
+            type="auth_state_update",
+            account_id=account_id,
+            status=status,
+            checked=idx,
+            total=total,
+            valid=valid,
+            revoked=revoked,
+            skipped=skipped,
+        )
+
+    _event(
+        sid,
+        type="done",
+        ok=True,
+        total=total,
+        valid=valid,
+        revoked=revoked,
+        skipped=skipped,
+    )
+
+
+def m_auth_refresh_state(params):
+    _require_license()
+    group_id = params.get("group_id")
+    accounts = db.get_accounts_with_valid_session(int(group_id) if group_id is not None else None)
+    sid = _start_session("auth_refresh_state", _run_auth_state_refresh, {**params, "accounts": accounts})
+    return {"session_id": sid, "total": len(accounts)}
+
+
 def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dict, driver_holder: dict, approve_evt: threading.Event):
     import auth_harvester
-    from concurrent.futures import ThreadPoolExecutor
 
-    accounts = params.get("accounts") or []
-    try:
-        concurrency = max(1, int(params.get("concurrency") or 1))
-    except (TypeError, ValueError):
-        concurrency = 1
-    concurrency = min(concurrency, max(1, len(accounts)))
-
+    accounts = list(params.get("accounts") or [])
     log = _log_fn_for(sid)
+    requested_concurrency = max(1, int(params.get("concurrency") or 1))
+    concurrency = min(requested_concurrency, max(len(accounts), 1))
+    max_passes = int(params.get("max_passes") or 0)  # 0 = loop forever until all ok or stopped
+    pass_backoff_seconds = float(params.get("pass_backoff_seconds") or 15.0)
     _event(sid, type="status", status="starting", total=len(accounts), concurrency=concurrency)
-    log(f"Farm starting — {len(accounts)} accounts, concurrency={concurrency}")
+
+    if not accounts:
+        _event(sid, type="done", ok=True)
+        return
 
     cleared = db.clear_proxies_without_valid_session()
     if cleared:
-        log(f"Cleared {cleared} stale proxy assignment{'s' if cleared != 1 else ''} from unauthenticated accounts.")
+        log(f"Cleared {cleared} stale proxy assignment{'s' if cleared != 1 else ''} from unauthenticated account{'s' if cleared != 1 else ''}.")
 
     auth_proxy_pool = [str(x).strip() for x in (params.get("auth_proxy_pool") or []) if str(x).strip()]
     auth_proxy_pool = list(dict.fromkeys(auth_proxy_pool))
@@ -472,6 +1205,7 @@ def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder
                 proxy_cursor = (idx + 1) % pool_len
                 proxies_in_flight.add(candidate)
                 return candidate
+
             candidate = auth_proxy_pool[proxy_cursor % pool_len]
             proxy_cursor = (proxy_cursor + 1) % pool_len
             proxies_in_flight.add(candidate)
@@ -486,119 +1220,226 @@ def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder
             if success:
                 proxies_assigned_this_run.add(proxy)
 
-    # Promote driver_holder to a multi-driver shape so parallel workers can
-    # all be interrupted by a single m_session_stop. We keep the legacy
-    # "driver" key working too by leaving it unset here.
-    driver_holder.setdefault("drivers", set())
-    driver_holder.setdefault("lock", threading.Lock())
+    total = len(accounts)
+    success_ids: set[int] = set()
+    failure_errors: dict[int, str] = {}
 
-    def _register_driver(d):
-        if d is None:
-            return
-        with driver_holder["lock"]:
-            driver_holder["drivers"].add(d)
-
-    def _unregister_driver(d):
-        if d is None:
-            return
-        with driver_holder["lock"]:
-            driver_holder["drivers"].discard(d)
-
-    completed = {"n": 0}
-    completed_lock = threading.Lock()
-
-    def _run_one(idx: int, account: dict):
+    def process_account(worker_idx: int, item_idx: int, account: dict, pass_num: int, pass_total: int) -> bool:
         if stop_evt.is_set():
-            return
-        phone = account.get("phone") or ""
-        prefix = f"[{idx}/{len(accounts)}] {phone}"
-        log(f"{prefix} starting")
-        country_iso, local_digits = _split_phone(phone)
-        my_driver = {"d": None}
-
-        def _capture_driver(d):
-            my_driver["d"] = d
-            _register_driver(d)
-
-        def _wlog(msg, level="info"):
-            log(f"{prefix}: {msg}", level)
-
+            return False
+        phone_label = str(account.get("phone") or "")
+        log(f"[pass {pass_num} · W{worker_idx} · {item_idx}/{pass_total}] {phone_label}")
+        country_iso, local_digits = _split_phone(account.get("phone") or "")
+        local_driver_ref = {"driver": None}
         account_id = int(account["id"])
         account_has_valid_auth = db.account_has_valid_session(account_id)
         retained_proxy = str(account.get("proxy") or "").strip() if account_has_valid_auth else ""
         borrowed_proxy = None if account_has_valid_auth else borrow_auth_proxy()
-        auth_proxy = retained_proxy or borrowed_proxy or account.get("proxy")
+        auth_proxy = retained_proxy or borrowed_proxy
+        proxy_for_event = auth_proxy or ""
+        proxy_origin = "retained" if retained_proxy else ("borrowed" if borrowed_proxy else "none")
+        started_at = time.time()
+        _event(
+            sid, type="auth_update", account_id=account["id"], status="running",
+            phone=phone_label, email=account.get("email") or "",
+            proxy=proxy_for_event, proxy_origin=proxy_origin, started_at=started_at,
+        )
         if borrowed_proxy:
-            _wlog("borrowed auth proxy from pool.")
+            log(f"{phone_label}: borrowed auth proxy from pool.")
         elif retained_proxy:
-            _wlog("retaining existing proxy from active session.")
-
-        success = False
+            log(f"{phone_label}: retaining existing proxy from active session.")
         try:
             result = auth_harvester.login_single_account(
                 phone=local_digits,
                 country_iso=account.get("country_iso") or country_iso,
-                email=(account.get("aycd_email") or account.get("email")),
+                email=account.get("email"),
                 proxy=auth_proxy,
                 session_dir=_session_dir(),
                 aycd_key=account.get("aycd_key"),
-                imap_email=account.get("imap_email"),
+                imap_email=account.get("imap_email") or account.get("email"),
                 imap_password=account.get("imap_password"),
-                imap_host=account.get("imap_host") or "imap.gmail.com",
-                imap_recipient=account.get("email") or "",
-                log_fn=_wlog,
-                on_driver=_capture_driver,
+                imap_host="imap.gmail.com",
+                session_phone=account.get("phone") or local_digits,
+                log_fn=log,
+                on_driver=lambda d: (
+                    local_driver_ref.update(driver=d),
+                    _register_driver(driver_holder, d),
+                ),
             )
             if result.get("ok") and result.get("bearer_token"):
-                try:
-                    db.save_session(account_id, result["bearer_token"], phone=phone)
-                except Exception as exc:
-                    _wlog(f"DB save failed: {exc}", "error")
+                db.save_session(account_id, result["bearer_token"], phone=account["phone"])
                 if borrowed_proxy:
-                    try:
-                        db.update_account(account_id, proxy=borrowed_proxy)
-                        account["proxy"] = borrowed_proxy
-                        _wlog("assigned auth proxy to account.")
-                    except Exception as exc:
-                        _wlog(f"Failed to persist borrowed proxy: {exc}", "warning")
-                _event(sid, type="auth_update", account_id=account_id, status="ok")
-                success = True
-            else:
-                _event(sid, type="auth_update", account_id=account_id, status="fail",
-                       error=result.get("error"))
+                    db.update_account(account_id, proxy=borrowed_proxy)
+                    account["proxy"] = borrowed_proxy
+                    log(f"{phone_label}: assigned auth proxy to account.")
+                _event(
+                    sid, type="auth_update", account_id=account_id, status="ok",
+                    phone=phone_label, email=account.get("email") or "",
+                    proxy=proxy_for_event, proxy_origin=proxy_origin,
+                    started_at=started_at, finished_at=time.time(),
+                    duration_s=round(time.time() - started_at, 2),
+                )
+                finish_auth_proxy(borrowed_proxy, success=True)
+                return True
+            error = result.get("error") or "unknown error"
+            failure_errors[account_id] = error
+            _event(
+                sid, type="auth_update", account_id=account_id, status="fail", error=error,
+                phone=phone_label, email=account.get("email") or "",
+                proxy=proxy_for_event, proxy_origin=proxy_origin,
+                started_at=started_at, finished_at=time.time(),
+                duration_s=round(time.time() - started_at, 2),
+            )
+            finish_auth_proxy(borrowed_proxy, success=False)
+            return False
         except Exception as exc:
-            _wlog(f"error: {exc}", "error")
-            _event(sid, type="auth_update", account_id=account_id, status="fail", error=str(exc))
+            log(f"{phone_label}: {exc}", "error")
+            failure_errors[account_id] = str(exc)
+            _event(
+                sid, type="auth_update", account_id=account_id, status="fail", error=str(exc),
+                phone=phone_label, email=account.get("email") or "",
+                proxy=proxy_for_event, proxy_origin=proxy_origin,
+                started_at=started_at, finished_at=time.time(),
+                duration_s=round(time.time() - started_at, 2),
+            )
+            finish_auth_proxy(borrowed_proxy, success=False)
+            return False
         finally:
-            finish_auth_proxy(borrowed_proxy, success=success)
-            _unregister_driver(my_driver["d"])
-            with completed_lock:
-                completed["n"] += 1
-                n = completed["n"]
-            _event(sid, type="progress", done=n, total=len(accounts))
+            _unregister_driver(driver_holder, local_driver_ref.get("driver"))
 
-    with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures = [ex.submit(_run_one, i, acct) for i, acct in enumerate(accounts, start=1)]
-        for f in futures:
-            try:
-                f.result()
-            except Exception as exc:
-                log(f"Worker crashed: {exc}", "error")
+    pass_num = 0
+    pending = list(accounts)
+    while pending and not stop_evt.is_set():
+        pass_num += 1
+        pass_total = len(pending)
+        log(f"── Auth pass {pass_num} — {pass_total} pending account{'s' if pass_total != 1 else ''}, concurrency {concurrency}")
+        _event(
+            sid,
+            type="auth_pass",
+            pass_number=pass_num,
+            pending=pass_total,
+            total=total,
+            succeeded=len(success_ids),
+        )
 
-    if stop_evt.is_set():
-        log("Farm stopped by user.", "warning")
-        _event(sid, type="done", ok=False, error="stopped")
-    else:
-        log(f"Farm finished — {completed['n']}/{len(accounts)} accounts processed.")
-        _event(sid, type="done", ok=True)
+        work_q: queue.Queue[tuple[int, dict]] = queue.Queue()
+        for idx, account in enumerate(pending, start=1):
+            work_q.put((idx, account))
+
+        pass_successes: set[int] = set()
+        pass_successes_lock = threading.Lock()
+
+        def worker_loop(worker_idx: int) -> None:
+            while not stop_evt.is_set():
+                try:
+                    item_idx, account = work_q.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    ok = process_account(worker_idx, item_idx, account, pass_num, pass_total)
+                    if ok:
+                        with pass_successes_lock:
+                            pass_successes.add(int(account["id"]))
+                finally:
+                    work_q.task_done()
+
+        threads = [
+            threading.Thread(target=worker_loop, args=(worker_idx,), daemon=True)
+            for worker_idx in range(1, concurrency + 1)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        success_ids.update(pass_successes)
+        pending = [a for a in pending if int(a["id"]) not in success_ids]
+
+        log(
+            f"── Pass {pass_num} complete — {len(pass_successes)} authed, "
+            f"{len(pending)} remaining (total {len(success_ids)}/{total})"
+        )
+
+        if not pending:
+            break
+        if stop_evt.is_set():
+            break
+        if max_passes and pass_num >= max_passes:
+            log(f"Reached max_passes={max_passes}; stopping with {len(pending)} still pending.", "warning")
+            break
+
+        # Brief cool-down before next pass so rate limiting eases.
+        log(f"Waiting {int(pass_backoff_seconds)}s before next pass…")
+        if stop_evt.wait(timeout=pass_backoff_seconds):
+            break
+
+    summary_ok = not pending
+    _event(
+        sid,
+        type="done",
+        ok=summary_ok,
+        total=total,
+        succeeded=len(success_ids),
+        failed=len(pending),
+        passes=pass_num,
+    )
 
 
 def m_auth_farm(params):
+    _require_license()
     sid = _start_session("auth_farm", _run_auth_farm, params)
     return {"session_id": sid}
 
 
 # ── Cart / purchase ────────────────────────────────────────────────────────
+
+def _load_cart_session(client, account: dict, log) -> bool:
+    if client.load_session():
+        return True
+
+    account_id = int(account.get("id") or 0)
+    if not account_id:
+        return False
+
+    session = db.get_session(account_id)
+    if not session:
+        return False
+
+    saved_at = float(session.get("saved_at") or 0)
+    if not saved_at or (time.time() - saved_at) >= db.SESSION_MAX_AGE:
+        return False
+
+    token = str(session.get("bearer_token") or "").strip()
+    if not token:
+        return False
+
+    log("Session file missing or stale; retrying with the DB-backed token.")
+    client.bearerToken = token
+    device_id = str(session.get("device_id") or "").strip()
+    if device_id:
+        client.deviceId = device_id
+
+    try:
+        resp = client._api_get("/users/me", api_ts="2024-03-25")
+    except Exception as exc:
+        log(f"DB-backed session validation failed: {exc}", "warning")
+        client.bearerToken = None
+        return False
+
+    if resp.status_code != 200:
+        if resp.status_code in (401, 403):
+            db.delete_session(account_id)
+            log("DB-backed session was expired/revoked; cleared cached session.", "warning")
+        else:
+            log(f"DB-backed session validation returned {resp.status_code}.", "warning")
+        client.bearerToken = None
+        return False
+
+    try:
+        client.save_session()
+    except Exception as exc:
+        log(f"Could not sync session file from DB token: {exc}", "warning")
+    return True
 
 def _run_cart_inner(
     sid: str,
@@ -608,19 +1449,13 @@ def _run_cart_inner(
     stop_evt: threading.Event,
     driver_holder: dict,
     approve_evt: threading.Event,
-    task_id: int | None = None,
-) -> tuple[bool, str]:
-    """Runs the cart flow. Returns (ok, error). Emits cart_update events.
-    Does NOT emit 'done' — caller is responsible for that."""
+):
     import dice_requests
 
     log = _log_fn_for(sid)
 
     def emit_update(**fields):
-        payload = {"account_id": account.get("id"), **fields}
-        if task_id is not None:
-            payload["task_id"] = task_id
-        _event(sid, type="cart_update", **payload)
+        _event(sid, type="cart_update", account_id=account.get("id"), **fields)
 
     emit_update(status="starting", event_url=event_url)
 
@@ -635,77 +1470,170 @@ def _run_cart_inner(
         target_min_price=params.get("target_min_price") or params.get("min_price"),
         target_max_price=params.get("target_max_price") or params.get("max_price"),
         ticket_tier=params.get("ticket_tier"),
+        ticket_type_id=params.get("ticket_type_id"),
+        tier_strategy=params.get("tier_strategy"),
+        tier_keywords=params.get("tier_keywords"),
+        allowed_tier_ids=params.get("allowed_tier_ids"),
+        price_rules=_clean_price_rules(params.get("price_rules")),
         session_dir=_session_dir(),
         log_fn=log,
     )
 
-    if not client.load_session():
+    if not _load_cart_session(client, account, log):
         return False, "No valid session — run auth first"
 
     client.visit_event_page()
     if stop_evt.is_set():
         return False, "stopped"
+    if not client.eventId:
+        return False, f"Could not extract event ID from event URL/page: {client.eventUrl or event_url}"
 
-    # Probe the event once so we know if it's locked, and claim the access
-    # code before any timing-critical work. Claims are per-account-per-event
-    # and persist server-side, so a single upfront claim is enough.
+    presale_code = (params.get("presale_code") or "").strip()
+    target_ts = _parse_scheduled_ts(params.get("scheduled_at") or "", params.get("scheduled_tz") or "")
+    scheduled_future = target_ts is not None and target_ts > time.time()
+    access_code_error = ""
+    if presale_code:
+        if scheduled_future:
+            log(f"Access code '{presale_code}' assigned to this profile — will claim exactly when the sale goes live.")
+        else:
+            log(f"Access code '{presale_code}' assigned to this profile — claiming now.")
+            code_ok, access_code_error = _claim_cart_access_code(client, log)
+            if code_ok:
+                log(f"Access code '{presale_code}' accepted.")
+            else:
+                return False, f"Access code claim failed: {access_code_error}"
+
     probe = client.fetch_ticket_types(authenticated=True)
     if probe is None:
         return False, "Failed to fetch event"
-    presale_code = (params.get("presale_code") or "").strip()
+
     if client.eventIsLocked:
         if not presale_code:
             return False, "Event is locked — add an access code to this task"
-        log("Event is locked — claiming access code.")
-        resp = client.claim_code()
-        if not resp or resp.status_code != 200:
-            return False, "Access code claim failed"
-        # Refresh state after claim so the poller starts from a known-good place
-        client.fetch_ticket_types(authenticated=True)
+        if not getattr(client, "accessCodeClaimed", False):
+            if scheduled_future:
+                log(f"Event is locked; access code '{presale_code}' claim is deferred until the scheduled sale time.")
+            else:
+                log(f"Event is locked — claiming access code '{presale_code}'.")
+                code_ok, access_code_error = _claim_cart_access_code(client, log)
+                if code_ok:
+                    client.fetch_ticket_types(authenticated=True)
+                else:
+                    return False, f"Access code claim failed: {access_code_error}"
 
-    target_ts = _parse_scheduled_ts(params.get("scheduled_at") or "", params.get("scheduled_tz") or "")
-    if client.reserveToken:
-        # Probe already got an eligible reserve_token — fire now regardless
-        # of whether this task was scheduled for later.
-        log("Reserve token already held from probe — firing immediately.")
-    elif target_ts is not None and target_ts - time.time() > 3.0:
-        log(f"Scheduled drop at {params.get('scheduled_at')} {params.get('scheduled_tz')} "
-            f"(T-{target_ts - time.time():.1f}s) — will fire as soon as a reserve_token is available.")
-        emit_update(status="armed", scheduled_at=params.get("scheduled_at"),
-                    scheduled_tz=params.get("scheduled_tz"))
-        got_token = _wait_and_poll_for_drop(client, target_ts, stop_evt, log)
+    fire_window_enabled = params.get("pre_drop_fire_window_enabled")
+    if fire_window_enabled is None:
+        fire_window_enabled = True
+    fire_window_seconds = _PRE_DROP_FIRE_WINDOW if fire_window_enabled else 0.0
+
+    has_probe_token = client.reserveToken and not (
+        presale_code and scheduled_future and not getattr(client, "accessCodeClaimed", False)
+    )
+    in_fire_window = scheduled_future and (target_ts - time.time()) <= fire_window_seconds
+    if has_probe_token and (not scheduled_future or in_fire_window):
+        if scheduled_future and fire_window_seconds > 0:
+            log(
+                f"Reserve token held from probe and inside {fire_window_seconds:.0f}s fire window "
+                f"(T-{target_ts - time.time():.1f}s) — firing now."
+            )
+        elif scheduled_future:
+            log(
+                f"Reserve token held from probe at scheduled drop "
+                f"(T-{target_ts - time.time():.1f}s) — firing now."
+            )
+        else:
+            log("Reserve token already held from probe — firing immediately.")
+    elif scheduled_future:
+        if has_probe_token and fire_window_seconds > 0:
+            log(
+                f"Reserve token already held from probe — holding until {fire_window_seconds:.0f}s "
+                f"before drop at {params.get('scheduled_at')} {params.get('scheduled_tz')} "
+                f"(T-{target_ts - time.time():.1f}s)."
+            )
+        elif has_probe_token:
+            log(
+                f"Reserve token already held from probe — holding until scheduled drop "
+                f"at {params.get('scheduled_at')} {params.get('scheduled_tz')} "
+                f"(T-{target_ts - time.time():.1f}s)."
+            )
+        elif fire_window_seconds > 0:
+            log(
+                f"Scheduled drop at {params.get('scheduled_at')} {params.get('scheduled_tz')} "
+                f"(T-{target_ts - time.time():.1f}s) — will fire as soon as a reserve_token is "
+                f"available within {fire_window_seconds:.0f}s of drop."
+            )
+        else:
+            log(
+                f"Scheduled drop at {params.get('scheduled_at')} {params.get('scheduled_tz')} "
+                f"(T-{target_ts - time.time():.1f}s) — will fire at the scheduled instant only."
+            )
+        emit_update(
+            status="armed",
+            scheduled_at=params.get("scheduled_at"),
+            scheduled_tz=params.get("scheduled_tz"),
+        )
+        got_token = _wait_and_poll_for_drop(
+            client, target_ts, stop_evt, log, fire_window_seconds=fire_window_seconds,
+        )
         if stop_evt.is_set():
             return False, "stopped"
         if not got_token:
+            if presale_code and not getattr(client, "accessCodeClaimed", False):
+                error = getattr(client, "lastAccessCodeError", None) or access_code_error
+                if error:
+                    return False, f"No tickets available after drop; access code claim failed: {error}"
             return False, "No tickets available after drop"
     else:
-        # Immediate flow — probe already set reserveToken on success. If the
-        # event was locked we just refreshed after the claim; either way a
-        # non-empty reserveToken means we have a ticket to cart.
         if not client.reserveToken:
+            if presale_code and not getattr(client, "accessCodeClaimed", False):
+                log(f"Retrying access code '{presale_code}' before final ticket check.")
+                code_ok, access_code_error = _claim_cart_access_code(client, log)
+                if code_ok:
+                    log(f"Access code '{presale_code}' accepted.")
             client.fetch_ticket_types(authenticated=True)
         if not client.reserveToken:
+            if presale_code and not getattr(client, "accessCodeClaimed", False) and access_code_error:
+                return False, f"No tickets available; access code claim failed: {access_code_error}"
             return False, "No tickets available"
 
     if stop_evt.is_set():
         return False, "stopped"
 
-    mode = params.get("mode", "auto")
-
-    if mode == "manual":
-        emit_update(
-            status="reserved",
-            ticket_name=client.ticketName,
-            ticket_price=client.ticketPrice,
-            ticket_currency=client.ticketCurrency,
-            event_name=client.eventName,
-            ttl=300,
+    rule_quantity = getattr(client, "selected_quantity", None)
+    requested_quantity = max(1, int(rule_quantity if rule_quantity else (params.get("quantity") or 1)))
+    allowed_quantity = max(1, int(getattr(client, "ticketMaxPerOrder", 0) or requested_quantity))
+    final_quantity = min(requested_quantity, allowed_quantity)
+    quantity_warning = ""
+    if requested_quantity > allowed_quantity:
+        quantity_warning = (
+            f"Requested {requested_quantity} ticket(s), but {client.ticketName or 'this tier'} "
+            f"allows max {allowed_quantity}. Using {allowed_quantity}."
         )
-        _event(sid, type="await_approval")
-        if not approve_evt.wait(timeout=300):
-            return False, "Approval timeout — ticket released"
-        if stop_evt.is_set():
-            return False, "stopped"
+        log(quantity_warning)
+
+    mode = params.get("mode", "auto")
+    approval_cfg = _approval_config(params)
+    approval_required = (
+        bool(params.get("require_approval"))
+        or mode == "manual"
+        or bool(approval_cfg["webhook_url"] and approval_cfg["poll_url"])
+    )
+    if approval_required:
+        approved, approval_error = _wait_for_checkout_approval(
+            sid=sid,
+            account=account,
+            client=client,
+            params={**params, "quantity": final_quantity},
+            requested_quantity=requested_quantity,
+            final_quantity=final_quantity,
+            quantity_warning=quantity_warning,
+            stop_evt=stop_evt,
+            approve_evt=approve_evt,
+            emit_update=emit_update,
+            log=log,
+        )
+        if not approved:
+            return False, approval_error or "Approval declined"
 
     emit_update(
         status="purchasing",
@@ -713,10 +1641,14 @@ def _run_cart_inner(
         ticket_price=client.ticketPrice,
         ticket_currency=client.ticketCurrency,
         event_name=client.eventName,
+        quantity=final_quantity,
+        total_price=(float(client.ticketPrice or 0) * final_quantity),
+        requested_quantity=requested_quantity,
+        quantity_warning=quantity_warning,
     )
 
     ok = client.run_purchase_flow(
-        quantity=int(params.get("quantity") or 1),
+        quantity=final_quantity,
         card_number=account.get("card_number") or "",
         exp_month=str(account.get("card_exp_month") or account.get("exp_month") or ""),
         exp_year=str(account.get("card_exp_year") or account.get("exp_year") or ""),
@@ -752,9 +1684,8 @@ def _run_cart_inner(
                 purchase_status="purchased",
                 purchased_at=_ts(),
             )
-            _event(sid, type="inventory_update")
         except Exception as exc:
-            log(f"Inventory record failed: {exc}", "warning")
+            log(f"Inventory record failed (local DB): {exc}", "error")
         emit_update(
             status="purchased",
             purchase_id=client.purchaseId,
@@ -764,50 +1695,40 @@ def _run_cart_inner(
             ticket_name=client.ticketName,
             ticket_price=client.ticketPrice,
             ticket_currency=client.ticketCurrency,
+            requested_quantity=requested_quantity,
+            quantity_warning=quantity_warning,
         )
         return True, ""
+
     emit_update(status="purchase_failed")
     return False, "Purchase failed — see logs"
 
 
+def _run_cart(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dict, driver_holder: dict, approve_evt: threading.Event):
+    account = params["account"]
+    event_url = params["event_url"]
+    log = _log_fn_for(sid)
+    try:
+        ok, err = _run_cart_inner(sid, account, event_url, params, stop_evt, driver_holder, approve_evt)
+        _event(sid, type="done", ok=ok, error=err or None)
+    except Exception as exc:
+        log(f"Cart run failed: {exc}", "error")
+        _event(sid, type="done", ok=False, error=str(exc))
+
+
 def m_cart_run(params):
-    """Quick one-off purchase. Creates an ephemeral task row and runs it via
-    the same _run_task path as persistent tasks. The row is deleted on
-    terminal status so it never appears on the Tasks page."""
+    _require_license()
     account = params.get("account") or {}
-    account_id = int(account.get("id") or 0)
-    if not db.account_has_valid_session(account_id):
+    if not db.account_has_valid_session(int(account.get("id") or 0)):
         raise RuntimeError("Account has no valid session — run Auth Farm first")
-
-    event_url = (params.get("event_url") or "").strip()
-    if not event_url:
-        raise RuntimeError("event_url is required")
-
-    tid = db.create_task(
-        account_id=account_id,
-        event_url=event_url,
-        min_price=params.get("target_min_price") or params.get("min_price"),
-        max_price=params.get("target_max_price") or params.get("max_price"),
-        presale_code=params.get("presale_code") or "",
-        ticket_tier=params.get("ticket_tier") or "",
-        quantity=params.get("quantity") or 1,
-        mode=params.get("mode") or "auto",
-        ephemeral=True,
-    )
-    task = db.get_task(tid)
-
-    sid = _start_session("task", _run_task, {
-        "task": task,
-        "account": db.get_account(account_id) or account,
-        "capsolver_key": params.get("capsolver_key"),
-        "twocaptcha_key": params.get("twocaptcha_key"),
-    })
-    return {"session_id": sid, "task_id": tid}
+    sid = _start_session("cart", _run_cart, params)
+    return {"session_id": sid}
 
 
-# ── Task runner ────────────────────────────────────────────────────────────
+# ── Task runner (persistent task with DB-backed lifecycle) ────────────────
 
 def _run_task(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dict, driver_holder: dict, approve_evt: threading.Event):
+    """Wrap _run_cart_inner with task-row lifecycle: status updates and last_error."""
     task = params["task"]
     account = params["account"]
     task_id = int(task["id"])
@@ -817,71 +1738,69 @@ def _run_task(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dic
     _event(sid, type="task_update", task_id=task_id, status="running")
 
     merged = {
-        "capsolver_key": params.get("capsolver_key"),
-        "twocaptcha_key": params.get("twocaptcha_key"),
-        "presale_code": task.get("presale_code") or "",
+        **(params.get("settings") or {}),
+        "event_url": task.get("event_url") or "",
+        "min_price": task.get("min_price"),
+        "max_price": task.get("max_price"),
         "target_min_price": task.get("min_price"),
         "target_max_price": task.get("max_price"),
-        "ticket_tier": task.get("ticket_tier"),
-        "quantity": task.get("quantity") or 1,
+        "presale_code": task.get("presale_code") or "",
+        "ticket_tier": task.get("ticket_tier") or "",
+        "quantity": int(task.get("quantity") or 1),
         "mode": task.get("mode") or "auto",
         "scheduled_at": task.get("scheduled_at") or "",
         "scheduled_tz": task.get("scheduled_tz") or "",
+        "capsolver_key": params.get("capsolver_key"),
+        "twocaptcha_key": params.get("twocaptcha_key"),
+        "captchafun_key": params.get("captchafun_key"),
     }
 
-    ok, err = False, ""
     try:
         ok, err = _run_cart_inner(
-            sid, account, task.get("event_url") or "", merged,
-            stop_evt, driver_holder, approve_evt, task_id=task_id,
+            sid, account, merged["event_url"], merged, stop_evt, driver_holder, approve_evt,
         )
     except Exception as exc:
-        err = str(exc)
         log(f"Task run failed: {exc}", "error")
-    finally:
-        if stop_evt.is_set() and not ok:
-            status = "stopped"
-        elif ok:
-            status = "done"
-        else:
-            status = "failed"
-        ephemeral = bool(task.get("ephemeral"))
-        if ephemeral:
-            # Quick-runs vanish once they terminate — their state lived
-            # only to unify the runner. The dashboard card still shows
-            # the final status because the event goes out below.
+        ok, err = False, str(exc)
+
+    final_status = "completed" if ok else ("stopped" if err == "stopped" else "failed")
+    db.set_task_status(task_id, final_status, session_id="", last_error=(err or "") if not ok else "")
+    _event(sid, type="task_update", task_id=task_id, status=final_status, error=err or None)
+
+    if task.get("ephemeral"):
+        try:
             db.delete_task(task_id)
-        else:
-            db.set_task_status(task_id, status, session_id="", last_error=err)
-        _event(sid, type="task_update", task_id=task_id, status=status, error=err or None, ephemeral=ephemeral)
-        _event(sid, type="done", ok=ok, error=err or None)
+        except Exception:
+            pass
+
+    _event(sid, type="done", ok=ok, error=err or None)
 
 
 def m_task_run(params):
-    tid = int(params["task_id"])
-    task = db.get_task(tid)
+    _require_license()
+    task = db.get_task(int(params["task_id"]))
     if not task:
         raise RuntimeError("Task not found")
-    if not task.get("event_url"):
-        raise RuntimeError("Task has no event URL — edit before starting")
-    account = db.get_account(int(task["account_id"]))
-    if not account:
-        raise RuntimeError("Account missing for task")
-    if not db.account_has_valid_session(int(account["id"])):
+    account_id = int(task["account_id"])
+    if not db.account_has_valid_session(account_id):
         raise RuntimeError("Account has no valid session — run Auth Farm first")
-
+    account = db.get_account(account_id)
+    if not account:
+        raise RuntimeError("Account not found")
     sid = _start_session("task", _run_task, {
         "task": task,
         "account": account,
         "capsolver_key": params.get("capsolver_key"),
         "twocaptcha_key": params.get("twocaptcha_key"),
+        "captchafun_key": params.get("captchafun_key"),
+        "settings": params.get("settings") or {},
     })
-    return {"session_id": sid, "task_id": tid}
+    return {"session_id": sid, "task_id": int(task["id"])}
 
 
 def m_task_stop(params):
-    tid = int(params["task_id"])
-    task = db.get_task(tid)
+    task_id = int(params["task_id"])
+    task = db.get_task(task_id)
     if not task:
         return {"ok": False, "error": "task not found"}
     sid = task.get("session_id") or ""
@@ -890,14 +1809,22 @@ def m_task_stop(params):
             sess = _SESSIONS.get(sid)
         if sess:
             sess["stop"].set()
-            driver = (sess.get("driver_holder") or {}).get("driver")
-            if driver is not None:
+            for driver in _snapshot_drivers(sess.get("driver_holder") or {}):
                 try:
                     driver.quit()
                 except Exception:
                     pass
-    db.set_task_status(tid, "stopped", session_id="", last_error="")
+    db.set_task_status(task_id, "stopped", session_id="", last_error="stopped by user")
     return {"ok": True}
+
+
+def m_event_preview(params):
+    _require_license()
+    event_url = str(params.get("event_url") or "").strip()
+    if not event_url:
+        raise RuntimeError("event_url is required")
+    import venue_monitor
+    return venue_monitor.fetch_event_preview(event_url)
 
 
 # ── Session control ────────────────────────────────────────────────────────
@@ -909,28 +1836,11 @@ def m_session_stop(params):
     if not sess:
         return {"ok": False, "error": "session not found"}
     sess["stop"].set()
-    dh = sess.get("driver_holder") or {}
-    # Legacy single-driver shape (login_one, cart, task runners).
-    d = dh.get("driver")
-    if d is not None:
+    for driver in _snapshot_drivers(sess.get("driver_holder") or {}):
         try:
-            d.quit()
+            driver.quit()
         except Exception:
             pass
-    # Multi-driver shape (parallel auth farm).
-    drivers = dh.get("drivers")
-    if drivers:
-        lock = dh.get("lock")
-        if lock is not None:
-            with lock:
-                to_quit = list(drivers)
-        else:
-            to_quit = list(drivers)
-        for drv in to_quit:
-            try:
-                drv.quit()
-            except Exception:
-                pass
     return {"ok": True}
 
 
@@ -968,24 +1878,52 @@ METHODS = {
     "db.update_account": m_db_update_account,
     "db.delete_account": m_db_delete_account,
     "db.assign_group": m_db_assign_group,
+    "db.get_payment_pools": m_db_get_payment_pools,
+    "db.create_payment_pool": m_db_create_payment_pool,
+    "db.rename_payment_pool": m_db_rename_payment_pool,
+    "db.delete_payment_pool": m_db_delete_payment_pool,
+    "db.get_payment_cards": m_db_get_payment_cards,
+    "db.get_payment_card": m_db_get_payment_card,
+    "db.add_payment_card": m_db_add_payment_card,
+    "db.update_payment_card": m_db_update_payment_card,
+    "db.delete_payment_card": m_db_delete_payment_card,
+    "db.assign_card": m_db_assign_card,
+    "db.unassign_card": m_db_unassign_card,
+    "db.get_card_labels": m_db_get_card_labels,
+    "db.get_assigned_cards_for_account": m_db_get_assigned_cards_for_account,
+    "db.bulk_account_cards_by_label": m_db_bulk_account_cards_by_label,
+    "db.bulk_add_payment_cards": m_db_bulk_add_payment_cards,
+    "db.get_code_pools": m_db_get_code_pools,
+    "db.create_code_pool": m_db_create_code_pool,
+    "db.rename_code_pool": m_db_rename_code_pool,
+    "db.delete_code_pool": m_db_delete_code_pool,
+    "db.get_code_pool_codes": m_db_get_code_pool_codes,
+    "db.add_code_pool_codes": m_db_add_code_pool_codes,
+    "db.delete_code_pool_code": m_db_delete_code_pool_code,
+    "db.clear_code_pool": m_db_clear_code_pool,
+    "db.draw_codes_from_pool": m_db_draw_codes_from_pool,
     "db.import_file": m_db_import_file,
-    "db.import_tasks_file": m_db_import_tasks_file,
-    "db.get_inventory": m_db_get_inventory,
-    "db.delete_inventory_item": m_db_delete_inventory_item,
     "db.get_stats": m_db_get_stats,
     "db.get_accounts_needing_auth": m_db_get_accounts_needing_auth,
     "db.get_accounts_with_valid_session": m_db_get_accounts_with_valid_session,
     "db.get_session": m_db_get_session,
+    "db.get_inventory_items": m_db_get_inventory_items,
+    "db.delete_inventory_item": m_db_delete_inventory_item,
     "db.get_tasks": m_db_get_tasks,
     "db.get_task": m_db_get_task,
     "db.create_task": m_db_create_task,
     "db.update_task": m_db_update_task,
     "db.delete_task": m_db_delete_task,
+    "db.import_tasks_file": m_db_import_tasks_file,
     "auth.login_one": m_auth_login_one,
+    "auth.open_profile": m_auth_open_profile,
+    "auth.manual_login_one": m_auth_manual_login_one,
+    "auth.refresh_state": m_auth_refresh_state,
     "auth.farm": m_auth_farm,
     "cart.run": m_cart_run,
     "task.run": m_task_run,
     "task.stop": m_task_stop,
+    "event.preview": m_event_preview,
     "session.stop": m_session_stop,
     "session.approve": m_session_approve,
     "session.set_otp": m_session_set_otp,
@@ -1017,12 +1955,6 @@ def main() -> int:
         db.init_db()
     except Exception as exc:
         emit({"type": "log", "level": "error", "message": f"DB init failed: {exc}"})
-    try:
-        purged = db.purge_ephemeral_tasks()
-        if purged:
-            emit({"type": "log", "level": "info", "message": f"Cleared {purged} stale quick-run task(s) from prior session."})
-    except Exception as exc:
-        emit({"type": "log", "level": "error", "message": f"Ephemeral cleanup failed: {exc}"})
 
     emit({"type": "ready", "timestamp": _ts()})
 

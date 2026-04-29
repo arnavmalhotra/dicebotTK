@@ -1,6 +1,7 @@
 curl_cffi>=0.7
 requests
 pytz
+tzdata
 2captcha-python
 openpyxl
 undetected-chromedriver

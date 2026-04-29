@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+const { app, BrowserWindow, Menu, ipcMain, dialog, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const path = require("node:path");
 const fs = require("node:fs");
@@ -9,6 +9,7 @@ const { pipeline } = require("node:stream/promises");
 let mainWindow = null;
 let pyProc = null;
 let pyReady = false;
+let pyFatalError = null;
 const pending = new Map();
 let nextId = 1;
 const readyWaiters = [];
@@ -246,9 +247,6 @@ function resolveWorker() {
 
 function startPython() {
   const spec = resolveWorker();
-  // In packaged builds __dirname lives inside app.asar — joining ".." gives a
-  // virtual path that doesn't exist on disk, which Windows rejects as cwd.
-  // Use the worker's own real directory under resourcesPath instead.
   const cwd = app.isPackaged
     ? path.dirname(spec.command)
     : path.join(__dirname, "..");
@@ -258,16 +256,23 @@ function startPython() {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
+  const failWaiters = (err) => {
+    pyFatalError = err;
+    pyReady = false;
+    readyWaiters.splice(0).forEach((fn) => fn(err));
+    pending.forEach(({ reject }) => reject(err));
+    pending.clear();
+  };
+
   pyProc.on("error", (err) => {
     console.error("[worker] spawn error:", err);
     if (mainWindow) mainWindow.webContents.send("worker:log", { level: "error", message: `Worker spawn failed: ${err.message}` });
+    failWaiters(new Error(`worker spawn failed: ${err.message}`));
   });
 
   pyProc.on("exit", (code, signal) => {
     console.error(`[worker] exited code=${code} signal=${signal}`);
-    pyReady = false;
-    pending.forEach(({ reject }) => reject(new Error("worker exited")));
-    pending.clear();
+    failWaiters(new Error(`worker exited (code=${code} signal=${signal})`));
   });
 
   const stdoutRl = readline.createInterface({ input: pyProc.stdout });
@@ -283,6 +288,10 @@ function startPython() {
     if (msg.type === "ready") {
       pyReady = true;
       readyWaiters.splice(0).forEach((fn) => fn());
+      return;
+    }
+    if (msg.type === "error" && !pyReady) {
+      failWaiters(new Error(msg.error || "worker startup error"));
       return;
     }
     if (typeof msg.id === "number") {
@@ -307,7 +316,10 @@ function startPython() {
 
 function waitForReady() {
   if (pyReady) return Promise.resolve();
-  return new Promise((resolve) => readyWaiters.push(resolve));
+  if (pyFatalError) return Promise.reject(pyFatalError);
+  return new Promise((resolve, reject) => {
+    readyWaiters.push((err) => (err ? reject(err) : resolve()));
+  });
 }
 
 async function rpc(method, params = {}) {
@@ -333,8 +345,8 @@ function createWindow() {
     height: 820,
     minWidth: 1100,
     minHeight: 700,
-    title: "DiceBotTK",
-    backgroundColor: "#000000",
+    title: "DiceBot",
+    backgroundColor: "#0a0f14",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -342,7 +354,24 @@ function createWindow() {
     },
   });
   mainWindow.setMenuBarVisibility(false);
+  if (process.platform === "darwin") {
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      { role: "appMenu" },
+      { role: "editMenu" },
+      { role: "windowMenu" },
+    ]));
+  } else {
+    Menu.setApplicationMenu(null);
+  }
   mainWindow.loadFile(path.join(__dirname, "index.html"));
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown") return;
+    const key = input.key;
+    if ((key === "i" || key === "I") && input.alt && (input.meta || input.control)) {
+      mainWindow.webContents.toggleDevTools();
+      event.preventDefault();
+    }
+  });
   mainWindow.webContents.on("did-finish-load", () => {
     mainWindow?.webContents.send("update:event", updateState);
   });
@@ -364,22 +393,51 @@ function registerIpc() {
     ["db:update-account", "db.update_account"],
     ["db:delete-account", "db.delete_account"],
     ["db:assign-group", "db.assign_group"],
+    ["db:get-payment-pools", "db.get_payment_pools"],
+    ["db:create-payment-pool", "db.create_payment_pool"],
+    ["db:rename-payment-pool", "db.rename_payment_pool"],
+    ["db:delete-payment-pool", "db.delete_payment_pool"],
+    ["db:get-payment-cards", "db.get_payment_cards"],
+    ["db:get-payment-card", "db.get_payment_card"],
+    ["db:add-payment-card", "db.add_payment_card"],
+    ["db:update-payment-card", "db.update_payment_card"],
+    ["db:delete-payment-card", "db.delete_payment_card"],
+    ["db:assign-card", "db.assign_card"],
+    ["db:unassign-card", "db.unassign_card"],
+    ["db:get-card-labels", "db.get_card_labels"],
+    ["db:get-assigned-cards-for-account", "db.get_assigned_cards_for_account"],
+    ["db:bulk-account-cards-by-label", "db.bulk_account_cards_by_label"],
+    ["db:bulk-add-payment-cards", "db.bulk_add_payment_cards"],
+    ["db:get-code-pools", "db.get_code_pools"],
+    ["db:create-code-pool", "db.create_code_pool"],
+    ["db:rename-code-pool", "db.rename_code_pool"],
+    ["db:delete-code-pool", "db.delete_code_pool"],
+    ["db:get-code-pool-codes", "db.get_code_pool_codes"],
+    ["db:add-code-pool-codes", "db.add_code_pool_codes"],
+    ["db:delete-code-pool-code", "db.delete_code_pool_code"],
+    ["db:clear-code-pool", "db.clear_code_pool"],
+    ["db:draw-codes-from-pool", "db.draw_codes_from_pool"],
     ["db:get-stats", "db.get_stats"],
     ["db:get-accounts-needing-auth", "db.get_accounts_needing_auth"],
     ["db:get-accounts-with-valid-session", "db.get_accounts_with_valid_session"],
     ["db:get-session", "db.get_session"],
+    ["db:get-inventory-items", "db.get_inventory_items"],
+    ["db:delete-inventory-item", "db.delete_inventory_item"],
     ["db:get-tasks", "db.get_tasks"],
     ["db:get-task", "db.get_task"],
     ["db:create-task", "db.create_task"],
     ["db:update-task", "db.update_task"],
     ["db:delete-task", "db.delete_task"],
-    ["db:get-inventory", "db.get_inventory"],
-    ["db:delete-inventory-item", "db.delete_inventory_item"],
-    ["auth:login-one", "auth.login_one"],
-    ["auth:farm", "auth.farm"],
-    ["cart:run", "cart.run"],
+    ["db:import-tasks-file", "db.import_tasks_file"],
     ["task:run", "task.run"],
     ["task:stop", "task.stop"],
+    ["auth:login-one", "auth.login_one"],
+    ["auth:open-profile", "auth.open_profile"],
+    ["auth:manual-login-one", "auth.manual_login_one"],
+    ["auth:farm", "auth.farm"],
+    ["auth:refresh-state", "auth.refresh_state"],
+    ["cart:run", "cart.run"],
+    ["event:preview", "event.preview"],
     ["session:stop", "session.stop"],
     ["session:approve", "session.approve"],
     ["session:set-otp", "session.set_otp"],
@@ -413,24 +471,6 @@ function registerIpc() {
     }
   });
 
-  ipcMain.handle("db:import-tasks-file", async () => {
-    const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
-      title: "Import tasks CSV/XLSX",
-      properties: ["openFile"],
-      filters: [
-        { name: "Tasks", extensions: ["csv", "xlsx"] },
-        { name: "All files", extensions: ["*"] },
-      ],
-    });
-    if (canceled || !filePaths?.length) return { ok: false, error: "Cancelled" };
-    try {
-      const data = await rpc("db.import_tasks_file", { file_path: filePaths[0] });
-      return { ok: true, data };
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
-  });
-
   ipcMain.handle("shell:open-external", async (_evt, url) => {
     try {
       await shell.openExternal(url);
@@ -448,15 +488,14 @@ function registerIpc() {
     });
     if (canceled || !filePath) return { ok: false };
     const header =
-      "phone,email,card_number,exp_month,exp_year,cvc,billing_name,billing_email,billing_phone,billing_postal,billing_country,proxy,aycd_key,aycd_email,imap_email,imap_password,imap_host\n";
+      "phone,email,card_number,exp_month,exp_year,cvc,billing_name,billing_email,billing_phone,billing_postal,billing_country,proxy,aycd_key,gmail_email,gmail_app_password\n";
     const sample =
-      "+14155550100,sample@example.com,4242424242424242,12,2030,123,Sample User,sample@example.com,+14155550100,94103,US,user:pass@proxy.example:8000,,,sample@example.com,app-password-here,imap.gmail.com\n";
+      "+14155550100,sample@gmail.com,4242424242424242,12,2030,123,Sample User,sample@gmail.com,+14155550100,94103,US,user:pass@proxy.example:8000,,sample@gmail.com,abcd efgh ijkl mnop\n";
     fs.writeFileSync(filePath, header + sample);
     return { ok: true, filePath };
   });
 
   ipcMain.handle("app:get-version", async () => app.getVersion());
-
   ipcMain.handle("update:get-state", async () => ({ ...updateState }));
   ipcMain.handle("update:install", async () => {
     try {

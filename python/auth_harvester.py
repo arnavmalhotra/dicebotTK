@@ -885,7 +885,6 @@ def login_single_account(
     imap_email: str | None = None,
     imap_password: str | None = None,
     imap_host: str = "imap.gmail.com",
-    imap_recipient: str | None = None,
     session_phone: str | None = None,
     log_fn=None,
     on_driver=None,
@@ -903,10 +902,6 @@ def login_single_account(
     waits for the user to enter the phone number and submit the form
     themselves. Once the OTP screen appears, the OTP is fetched and entered
     automatically just like the fully-automated path.
-
-    ``imap_recipient`` is the address the OTP was sent to (the Dice account
-    email) — used as a server-side and local recipient filter for IMAP. Falls
-    back to ``email`` when not provided.
     """
     log = log_fn or (lambda msg, level="info": print(f"[{phone}] {msg}"))
     session_phone = (session_phone or phone or "").strip()
@@ -1011,14 +1006,11 @@ def login_single_account(
         imap_target_email = (imap_email or email or "").strip()
         if not otp_code and imap_target_email and imap_password:
             log(f"Fetching OTP via IMAP ({imap_target_email})...")
-            # imap_recipient is passed explicitly by the caller (the Dice
-            # account email — what the OTP was sent to). Fall back to `email`
-            # only if not provided.
             otp_code = fetch_otp_imap(
                 imap_email=imap_target_email,
                 imap_password=imap_password,
                 imap_host=imap_host,
-                recipient_email=imap_recipient if imap_recipient is not None else email,
+                imap_recipient=email,
                 log_fn=log,
             )
 

@@ -16,11 +16,12 @@
       </div>
       <nav class="nav-tabs" id="navTabs">
         <button class="nav-btn active" data-page="dashboard">Dashboard</button>
-        <button class="nav-btn" data-page="accounts">Accounts</button>
-        <button class="nav-btn" data-page="auth">Auth Farm</button>
-        <button class="nav-btn" data-page="tasks">Tasks</button>
         <button class="nav-btn" data-page="inventory">Inventory</button>
-        <button class="nav-btn" data-page="guide">Guide</button>
+        <button class="nav-btn" data-page="tasks">Tasks</button>
+        <button class="nav-btn" data-page="accounts">Accounts</button>
+        <button class="nav-btn" data-page="profiles">Cards</button>
+        <button class="nav-btn" data-page="codepools">Code Pools</button>
+        <button class="nav-btn" data-page="auth">Auth Farm</button>
         <button class="nav-btn" data-page="settings">Settings</button>
       </nav>
       <div class="nav-right">
@@ -36,11 +37,10 @@
         <div class="page-header">
           <div>
             <h2>Dashboard</h2>
-            <p class="muted">Session health and running carts</p>
+            <p class="muted">Reserved carts and approval queue</p>
           </div>
           <div class="page-actions">
-            <button class="btn btn-ghost" id="gotoGuideBtn">How it works</button>
-            <button class="btn btn-primary" id="newCartBtn">One-off cart run</button>
+            <button class="btn btn-primary" id="newCartBtn">Start cart run</button>
           </div>
         </div>
 
@@ -53,102 +53,23 @@
 
         <div class="panel">
           <div class="panel-title">Active carts</div>
+          <div class="accounts-toolbar dashboard-toolbar" id="cartApprovalBar" hidden>
+            <div class="muted" id="cartApprovalSummary">0 carts awaiting approval</div>
+            <div class="toolbar-right dashboard-toolbar-right">
+              <button class="btn btn-ghost btn-sm" id="dismissOneBtn">Dismiss 1</button>
+              <button class="btn btn-ghost btn-sm" id="dismissAllBtn">Dismiss all</button>
+              <button class="btn btn-ghost btn-sm" id="approveOneBtn">Approve 1</button>
+              <div class="dashboard-approve-count">
+                <span class="dashboard-inline-label">Approve next</span>
+                <input type="number" min="1" step="1" id="approveCountInput" value="2" />
+                <span class="dashboard-inline-label">carts</span>
+                <button class="btn btn-ghost btn-sm" id="approveCountBtn">Approve next</button>
+              </div>
+              <button class="btn btn-primary btn-sm" id="approveAllBtn">Approve all</button>
+            </div>
+          </div>
           <div id="cartGrid" class="cart-grid">
-            <div class="empty-state">No carts running. Start tasks from the Tasks page or kick off a one-off run.</div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ── Accounts ──────────────────────────────────────────────── -->
-      <section class="page" id="page-accounts">
-        <div class="page-header">
-          <div>
-            <h2>Accounts</h2>
-            <p class="muted">Manage Dice.fm accounts, groups, and session tokens</p>
-          </div>
-          <div class="page-actions">
-            <button class="btn btn-ghost" id="showSampleBtn">Show sample</button>
-            <button class="btn btn-ghost" id="importBtn">Import CSV/XLSX</button>
-            <button class="btn btn-primary" id="addAccountBtn">Add account</button>
-          </div>
-        </div>
-
-        <div class="accounts-toolbar">
-          <div class="group-chips" id="groupChips"></div>
-          <div class="toolbar-right">
-            <input type="text" id="accountSearch" placeholder="Search phone, email…" />
-          </div>
-        </div>
-
-        <div class="bulk-bar" id="bulkBar" hidden>
-          <span id="bulkCount"></span>
-          <div class="bulk-actions">
-            <button class="btn btn-ghost btn-sm" id="bulkAssignBtn">Assign to group…</button>
-            <button class="btn btn-ghost btn-sm" id="bulkAuthBtn">Run auth</button>
-            <button class="btn btn-ghost btn-sm" id="bulkMakeTasksBtn">Create tasks</button>
-            <button class="btn btn-danger btn-sm" id="bulkDeleteBtn">Delete</button>
-            <button class="btn-icon" id="bulkClearBtn" title="Clear selection">✕</button>
-          </div>
-        </div>
-
-        <div class="panel accounts-panel">
-          <table class="accounts-table">
-            <thead>
-              <tr>
-                <th class="col-sel"><input type="checkbox" id="selectAll" /></th>
-                <th>Phone</th>
-                <th>Email</th>
-                <th>Group</th>
-                <th>Proxy</th>
-                <th>Session</th>
-                <th>Expires</th>
-                <th class="col-actions">Actions</th>
-              </tr>
-            </thead>
-            <tbody id="accountsBody"></tbody>
-          </table>
-          <div id="accountsEmpty" class="empty-state">No accounts yet. Click "Add account" or "Import CSV/XLSX".</div>
-        </div>
-      </section>
-
-      <!-- ── Auth Farm ─────────────────────────────────────────────── -->
-      <section class="page" id="page-auth">
-        <div class="page-header">
-          <div>
-            <h2>Auth Farm</h2>
-            <p class="muted">Harvest bearer tokens from Chrome logins — keep running 24x7 so sessions stay fresh</p>
-          </div>
-          <div class="page-actions">
-            <button class="btn btn-ghost" id="refreshAuthBtn">Refresh</button>
-            <button class="btn btn-primary" id="startFarmBtn">Start farm</button>
-            <button class="btn btn-danger" id="stopFarmBtn" hidden>Stop</button>
-          </div>
-        </div>
-
-        <div class="stats-row">
-          <div class="stat-card"><div class="stat-label">Total</div><div class="stat-value" id="farmTotal">—</div></div>
-          <div class="stat-card"><div class="stat-label">Active sessions</div><div class="stat-value cyan" id="farmActive">—</div></div>
-          <div class="stat-card"><div class="stat-label">Expiring</div><div class="stat-value warn" id="farmExpiring">—</div></div>
-          <div class="stat-card"><div class="stat-label">Needs auth</div><div class="stat-value danger" id="farmNeeds">—</div></div>
-        </div>
-
-        <div class="two-col">
-          <div class="panel">
-            <div class="panel-title">Queue</div>
-            <div class="queue-list" id="farmQueue">
-              <div class="empty-state">No accounts pending auth.</div>
-            </div>
-          </div>
-          <div class="panel">
-            <div class="panel-title">
-              <span>Log</span>
-              <span class="log-toolbar">
-                <button class="btn btn-ghost btn-sm" id="farmLogCopy" type="button">Copy</button>
-                <button class="btn btn-ghost btn-sm" id="farmLogExport" type="button">Export</button>
-                <button class="btn btn-ghost btn-sm" id="farmLogClear" type="button">Clear</button>
-              </span>
-            </div>
-            <div class="log-pane" id="farmLog"></div>
+            <div class="empty-state">No carts running. Click "Start cart run" to reserve tickets.</div>
           </div>
         </div>
       </section>
@@ -163,6 +84,7 @@
           <div class="page-actions">
             <button class="btn btn-ghost" id="refreshTasksBtn">Refresh</button>
             <button class="btn btn-ghost" id="importTasksBtn">Import CSV</button>
+            <button class="btn btn-ghost" id="exportTasksBtn">Export CSV</button>
             <button class="btn btn-primary" id="addTaskBtn">Add task</button>
           </div>
         </div>
@@ -194,92 +116,226 @@
         </div>
       </section>
 
-      <!-- ── Inventory ─────────────────────────────────────────────── -->
+
+      <!-- ── Inventory ────────────────────────────────────────────── -->
       <section class="page" id="page-inventory">
         <div class="page-header">
           <div>
             <h2>Inventory</h2>
-            <p class="muted">Tickets successfully purchased across every task and quick-run.</p>
+            <p class="muted">Successful checkouts across all accounts</p>
           </div>
           <div class="page-actions">
-            <button class="btn btn-ghost" id="refreshInventoryBtn">Refresh</button>
+            <button class="btn btn-ghost" id="exportInventoryBtn">Export CSV</button>
+            <button class="btn btn-ghost" id="exportInventoryJsonBtn">Export JSON</button>
+          </div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-card"><div class="stat-label">Checkouts</div><div class="stat-value" id="inventoryCount">—</div></div>
+          <div class="stat-card"><div class="stat-label">Tickets</div><div class="stat-value cyan" id="inventoryTickets">—</div></div>
+          <div class="stat-card"><div class="stat-label">Total spent</div><div class="stat-value" id="inventorySpent">—</div></div>
+          <div class="stat-card"><div class="stat-label">Unique events</div><div class="stat-value" id="inventoryEvents">—</div></div>
+        </div>
+
+        <div class="accounts-toolbar">
+          <div class="muted">Every successful checkout is recorded here automatically.</div>
+          <div class="toolbar-right">
+            <input type="text" id="inventorySearch" placeholder="Search account, event, ticket…" />
+          </div>
+        </div>
+
+        <div class="panel accounts-panel">
+          <table class="accounts-table">
+            <thead>
+              <tr>
+                <th>Purchased</th>
+                <th>Account</th>
+                <th>Event</th>
+                <th>Ticket</th>
+                <th>Qty</th>
+                <th>Price</th>
+                <th>Total</th>
+                <th>Purchase ID</th>
+                <th class="col-actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="inventoryBody"></tbody>
+          </table>
+          <div id="inventoryEmpty" class="empty-state">No successful checkouts yet.</div>
+        </div>
+      </section>
+
+      <!-- ── Accounts ──────────────────────────────────────────────── -->
+      <section class="page" id="page-accounts">
+        <div class="page-header">
+          <div>
+            <h2>Accounts</h2>
+            <p class="muted">Manage Dice.fm accounts, groups, and session tokens</p>
+            <p id="refreshAuthStateStatus" class="status-line muted">Session badges are cached. Use Refresh auth state for a live check.</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-ghost" id="refreshAuthStateBtn">Refresh auth state</button>
+            <button class="btn btn-ghost" id="showSampleBtn">Show sample</button>
+            <button class="btn btn-ghost" id="importBtn">Import CSV/XLSX</button>
+            <button class="btn btn-ghost" id="exportAccountsBtn">Export CSV</button>
+            <button class="btn btn-primary" id="addAccountBtn">Add account</button>
           </div>
         </div>
 
         <div class="accounts-toolbar">
-          <div style="display:flex; align-items:center; gap:12px; font-size:13px; color:var(--text-muted);">
-            <span id="inventorySummary">—</span>
-          </div>
+          <div class="group-chips" id="groupChips"></div>
           <div class="toolbar-right">
-            <input type="text" id="inventorySearch" placeholder="Search event, account, ticket…" />
+            <input type="text" id="accountSearch" placeholder="Search phone, email…" />
           </div>
         </div>
 
-        <div id="inventoryTableWrap" style="border:1px solid var(--border); border-radius:8px; overflow:auto; max-height:calc(100vh - 240px);">
-          <table id="inventoryTable" style="width:100%; border-collapse:collapse; font-size:12px;">
-            <thead style="position:sticky; top:0; background:var(--bg-1); z-index:1;">
+        <div class="bulk-bar" id="bulkBar" hidden>
+          <span id="bulkCount"></span>
+          <div class="bulk-actions">
+            <button class="btn btn-ghost btn-sm" id="bulkAssignBtn">Assign to group…</button>
+            <button class="btn btn-ghost btn-sm" id="bulkAuthBtn">Run auth</button>
+            <button class="btn btn-danger btn-sm" id="bulkDeleteBtn">Delete</button>
+            <button class="btn-icon" id="bulkClearBtn" title="Clear selection">✕</button>
+          </div>
+        </div>
+
+        <div class="panel accounts-panel">
+          <table class="accounts-table">
+            <thead>
               <tr>
-                <th>Purchased</th>
-                <th>Event</th>
-                <th>Date / Venue</th>
-                <th>Ticket</th>
-                <th>Qty</th>
-                <th>Total</th>
-                <th>Account</th>
-                <th>Purchase ID</th>
-                <th></th>
+                <th class="col-sel"><input type="checkbox" id="selectAll" /></th>
+                <th>Phone</th>
+                <th>Email</th>
+                <th>Group</th>
+                <th>Proxy</th>
+                <th>Session</th>
+                <th>Expires</th>
+                <th class="col-actions">Actions</th>
               </tr>
             </thead>
-            <tbody id="inventoryBody">
-              <tr><td colspan="9" style="padding:20px; text-align:center; color:var(--text-muted);">No tickets yet.</td></tr>
-            </tbody>
+            <tbody id="accountsBody"></tbody>
           </table>
+          <div id="accountsEmpty" class="empty-state">No accounts yet. Click "Add account" or "Import CSV/XLSX".</div>
         </div>
       </section>
 
-      <!-- ── Guide ─────────────────────────────────────────────────── -->
-      <section class="page" id="page-guide">
+      <!-- ── Payment Cards ────────────────────────────────────────── -->
+      <section class="page" id="page-profiles">
         <div class="page-header">
           <div>
-            <h2>Guide</h2>
-            <p class="muted">How to use DiceBotTK end-to-end</p>
+            <h2>Payment Cards</h2>
+            <p class="muted">Add cards with a label, then assign them to accounts. When scheduling a drop you pick a label, and each account uses its assigned card with that label.</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-ghost" id="manageCardPoolsBtn">Manage card pools</button>
+            <button class="btn btn-ghost" id="bulkImportCardsBtn">Bulk import (CSV)</button>
+            <button class="btn btn-primary" id="addCardBtn">+ Add card</button>
           </div>
         </div>
 
         <div class="panel">
-          <div class="panel-title">Flow</div>
-          <div class="guide-steps">
-            <div class="guide-step">
-              <div class="guide-num">1</div>
-              <h3>Import accounts from CSV</h3>
-              <p>Go to <strong>Accounts → Import CSV/XLSX</strong>. Each row is one account with the Dice.fm phone number, email, payment details, proxy, and optional AYCD key.</p>
-              <p style="margin-top:8px;">Expected header row:</p>
-              <pre class="guide-code">phone,email,card_number,exp_month,exp_year,cvc,billing_name,billing_email,billing_phone,billing_postal,billing_country,proxy,aycd_key</pre>
-              <p style="margin-top:8px;">Only <code>phone</code> is required. Download the sample from the Accounts page if you want a starting template.</p>
-            </div>
+          <div class="panel-title" id="cardsPanelTitle">All cards</div>
+          <div id="cardsList">
+            <div class="empty-state">No cards yet. Click "+ Add card" to add one.</div>
+          </div>
+        </div>
+      </section>
 
-            <div class="guide-step">
-              <div class="guide-num">2</div>
-              <h3>Keep the Auth Farm running 24×7</h3>
-              <p>Open the <strong>Auth Farm</strong> page and hit <strong>Start farm</strong>. Leave it running continuously — sessions are valid for ~6 days and the farm re-authenticates accounts as they age out.</p>
-              <ul>
-                <li><strong>Active sessions</strong> are ready to buy.</li>
-                <li><strong>Expiring</strong> get rotated automatically.</li>
-                <li><strong>Needs auth</strong> go to the front of the queue.</li>
-              </ul>
-              <p style="margin-top:8px;">Only accounts with a <em>valid session</em> can run tasks — the farm is what keeps that pool full.</p>
-            </div>
+      <!-- ── Code Pools ──────────────────────────────────────────── -->
+      <section class="page" id="page-codepools">
+        <div class="page-header">
+          <div>
+            <h2>Code Pools</h2>
+            <p class="muted">Save batches of presale / access codes. When launching a drop, pick a pool and one code is randomly assigned to each running profile.</p>
+          </div>
+          <div class="page-actions">
+            <button class="btn btn-primary" id="addCodePoolBtn">+ New code pool</button>
+          </div>
+        </div>
 
-            <div class="guide-step">
-              <div class="guide-num">3</div>
-              <h3>Run tasks</h3>
-              <p>Go to the <strong>Tasks</strong> page. Add one task per account you want to run for a given event, then set the event link, price range, presale code, tier, quantity, and mode.</p>
-              <ul>
-                <li><strong>Start</strong> an individual task or select multiple and <strong>Start</strong> / <strong>Stop</strong> / <strong>Edit</strong> in bulk.</li>
-                <li><strong>Manual</strong> mode reserves the ticket and waits for your approval. <strong>Auto</strong> purchases immediately.</li>
-                <li>Tasks for accounts without a valid session will refuse to start — auth them first.</li>
-              </ul>
+        <div class="panel">
+          <div class="panel-title" id="codePoolsPanelTitle">All code pools</div>
+          <div id="codePoolsList">
+            <div class="empty-state">No code pools yet. Click "+ New code pool" to create one.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── Auth Farm ─────────────────────────────────────────────── -->
+      <section class="page" id="page-auth">
+        <div class="page-header">
+          <div>
+            <h2>Auth Farm</h2>
+            <p class="muted">Harvest bearer tokens from Chrome logins — runs until every account is authenticated</p>
+          </div>
+          <div class="page-actions">
+            <label class="toolbar-inline-field">
+              <span>Concurrency</span>
+              <input type="number" min="1" step="1" id="farmConcurrency" value="1" />
+            </label>
+            <button class="btn btn-ghost" id="refreshAuthBtn">Refresh</button>
+            <button class="btn btn-primary" id="startFarmBtn">Start farm</button>
+            <button class="btn btn-danger" id="stopFarmBtn" hidden>Stop</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Auth proxy pool</div>
+          <div class="form-grid">
+            <label>
+              <span>Proxy pool</span>
+              <textarea id="authProxyPool" rows="7" placeholder="host:port:user:pass&#10;user:pass@host:port&#10;http://user:pass@host:port"></textarea>
+            </label>
+            <div class="status-line muted" id="authProxyPoolStatus">0 proxies saved. Unauthenticated accounts borrow from this pool and keep the proxy only after a successful auth.</div>
+          </div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-card"><div class="stat-label">Total</div><div class="stat-value" id="farmTotal">—</div></div>
+          <div class="stat-card"><div class="stat-label">Active sessions</div><div class="stat-value cyan" id="farmActive">—</div></div>
+          <div class="stat-card"><div class="stat-label">Expiring</div><div class="stat-value warn" id="farmExpiring">—</div></div>
+          <div class="stat-card"><div class="stat-label">Needs auth</div><div class="stat-value danger" id="farmNeeds">—</div></div>
+        </div>
+
+        <div class="two-col">
+          <div class="panel">
+            <div class="panel-title">Queue</div>
+            <div class="queue-list" id="farmQueue">
+              <div class="empty-state">No accounts pending auth.</div>
             </div>
+          </div>
+          <div class="panel">
+            <div class="panel-title">Log</div>
+            <div class="log-pane" id="farmLog"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header" style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+            <div class="panel-title" style="margin:0;">Proxy attempts</div>
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <span id="proxyStatsSummary" class="muted" style="font-size:12px;">No farm attempts yet.</span>
+              <button class="btn btn-ghost btn-sm" id="exportProxyCsvBtn">Export CSV</button>
+              <button class="btn btn-ghost btn-sm" id="exportProxyJsonBtn">Export JSON</button>
+              <button class="btn btn-ghost btn-sm" id="clearProxyStatsBtn">Clear</button>
+            </div>
+          </div>
+          <div class="accounts-panel">
+            <table class="accounts-table">
+              <thead>
+                <tr>
+                  <th>Started</th>
+                  <th>Account</th>
+                  <th>Proxy</th>
+                  <th>Status</th>
+                  <th>Duration</th>
+                  <th>Error</th>
+                </tr>
+              </thead>
+              <tbody id="proxyStatsBody">
+                <tr><td colspan="6" class="empty-state">No farm attempts yet.</td></tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </section>
@@ -289,7 +345,7 @@
         <div class="page-header">
           <div>
             <h2>Settings</h2>
-            <p class="muted">Captcha providers, AYCD, and defaults</p>
+            <p class="muted">Captcha providers and AYCD</p>
           </div>
         </div>
 
@@ -322,42 +378,35 @@
         </div>
 
         <div class="panel">
-          <div class="panel-title">Auth farm</div>
+          <div class="panel-title">Checkout Approval</div>
           <div class="form-grid">
             <label>
-              <span>Concurrency (parallel logins — 1 = sequential)</span>
-              <input type="number" min="1" max="100" step="1" id="farmConcurrency" placeholder="10" />
+              <span>Webhook URL (POST approval requests)</span>
+              <input type="text" id="approvalWebhookUrl" placeholder="https://example.com/api/dicebot/approval-request" />
             </label>
-            <p class="muted" style="font-size:11px; margin:-6px 0 0;">Each worker runs its own Chrome + proxy. Shared IMAP inboxes are demultiplexed by the account's <code>email</code> (To: header filter) and capped at 10 concurrent IMAP sessions per inbox.</p>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-title">Auth proxy pool</div>
-          <div class="form-grid">
             <label>
-              <span>Proxy pool (one per line)</span>
-              <textarea id="authProxyPool" rows="7" placeholder="host:port:user:pass&#10;user:pass@host:port&#10;http://user:pass@host:port"></textarea>
+              <span>Poll URL (GET approval status)</span>
+              <input type="text" id="approvalPollUrl" placeholder="https://example.com/api/dicebot/approval-status" />
             </label>
-            <p class="muted" style="font-size:11px; margin:-6px 0 0;" id="authProxyPoolStatus">0 proxies saved. Unauthenticated accounts borrow from this pool and keep the proxy only after a successful auth.</p>
+            <label>
+              <span>Shared secret</span>
+              <input type="password" id="approvalSecret" placeholder="Optional bearer token" />
+            </label>
+            <div class="muted" style="font-size:12px;">When configured, checkout waits for webhook approval before purchasing. Local Approve still works as a fallback.</div>
           </div>
         </div>
 
         <div class="panel">
           <div class="panel-title">Defaults</div>
           <div class="form-grid">
-            <label>
-              <span>Min price</span>
-              <input type="number" step="0.01" id="defaultMinPrice" />
-            </label>
-            <label>
-              <span>Max price</span>
-              <input type="number" step="0.01" id="defaultMaxPrice" />
-            </label>
-            <label>
-              <span>Preferred tier name (fuzzy)</span>
-              <input type="text" id="defaultTier" placeholder="GA, Tier 2, VIP…" />
-            </label>
+            <div style="grid-column:1 / -1;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <span>Default auto-buy rules</span>
+                <button type="button" class="btn btn-ghost btn-sm" id="defaultRulesAdd">+ Add rule</button>
+              </div>
+              <div id="defaultRulesList"></div>
+              <p class="muted" style="font-size:12px; margin:4px 0 0;">Each rule: buy N tickets if price is at most $X. New cart runs start with these. Evaluated in order — first matching rule wins.</p>
+            </div>
             <div class="form-buttons">
               <button class="btn btn-primary" id="saveSettingsBtn">Save settings</button>
             </div>

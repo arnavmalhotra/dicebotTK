@@ -4,39 +4,16 @@ from __future__ import annotations
 
 import html
 import re
-import threading
 import time
 from datetime import datetime, timedelta
 
 
-# ── Per-inbox IMAP concurrency gate ────────────────────────────────────────
-# Most IMAP providers cap concurrent sessions per account (Gmail ~15). We cap
-# lower to leave headroom. Accounts that share an inbox serialize through the
-# same semaphore; accounts on distinct inboxes don't contend.
-_IMAP_MAX_CONCURRENT = 10
-_IMAP_SEM_REGISTRY: dict[tuple[str, str], threading.Semaphore] = {}
-_IMAP_SEM_LOCK = threading.Lock()
 _OTP_PATTERNS = [
     re.compile(r"login code[:\s-]*(\d{4,6})", re.I),
     re.compile(r"dice[^0-9]{0,40}(\d{4,6})", re.I),
     re.compile(r"\b(\d{4,6})\b"),
 ]
 _RECEIVED_FOR_PATTERN = re.compile(r"for\s+<?([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})>?", re.I)
-
-
-def _imap_semaphore(host: str, email: str) -> threading.Semaphore:
-    key = (host.lower().strip(), email.lower().strip())
-    with _IMAP_SEM_LOCK:
-        sem = _IMAP_SEM_REGISTRY.get(key)
-        if sem is None:
-            sem = threading.Semaphore(_IMAP_MAX_CONCURRENT)
-            _IMAP_SEM_REGISTRY[key] = sem
-        return sem
-
-
-def _imap_escape(value: str) -> str:
-    """Escape double quotes for IMAP literal strings."""
-    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _decode_mime_header(value: str) -> str:
@@ -140,120 +117,116 @@ def fetch_otp_imap(
     imap_password: str,
     imap_host: str = "imap.gmail.com",
     imap_port: int = 993,
+    imap_recipient: str | None = None,
     timeout_seconds: int = 120,
     poll_interval: int = 5,
-    recipient_email: str | None = None,
     log_fn=None,
 ) -> str | None:
-    """Poll an IMAP inbox for the latest Dice OTP email and return the 4-digit code.
-
-    If recipient_email is set, recipient headers are checked locally after fetch.
-    This lets many accounts share a single forwarded inbox without stealing each
-    other's OTPs, even when IMAP server-side TO filtering is unreliable.
-    """
+    """Poll an IMAP inbox for the latest Dice OTP email and return the 4-digit code."""
     import imaplib
     import email as email_lib
-    from email.utils import parsedate_to_datetime
+    from email.utils import getaddresses
 
     log = log_fn or (lambda msg, level="info": print(f"[{level}] {msg}"))
     start_time = time.time()
+    recipient_filter = str(imap_recipient or "").strip().lower()
 
-    recipient_filter = str(recipient_email or "").strip().lower()
-
-    sem = _imap_semaphore(imap_host, imap_email)
-    sem.acquire()
+    log(f"Connecting to IMAP ({imap_host}:{imap_port}) as {imap_email}...")
     try:
-        log(f"Connecting to IMAP ({imap_host}:{imap_port}) as {imap_email}"
-            + (f" (recipient={recipient_filter})" if recipient_filter else "") + "...")
-        try:
-            mail = imaplib.IMAP4_SSL(imap_host, imap_port)
-            mail.login(imap_email, imap_password)
-        except Exception as exc:
-            log(f"IMAP login failed: {exc}", "error")
-            return None
+        mail = imaplib.IMAP4_SSL(imap_host, imap_port)
+        mail.login(imap_email, imap_password)
+    except Exception as exc:
+        log(f"IMAP login failed: {exc}", "error")
+        return None
 
-        try:
-            deadline = start_time + timeout_seconds
-            recipient_mismatch_logged = False
-            dice_candidate_logged = False
-            while time.time() < deadline:
-                try:
-                    mail.select("INBOX")
-                    status, msg_ids = mail.search(None, "ALL")
-                    if status != "OK" or not msg_ids or not msg_ids[0]:
-                        time.sleep(poll_interval)
+    if recipient_filter:
+        log(f"IMAP connected. Polling for Dice OTP email addressed to {recipient_filter}...")
+    else:
+        log("IMAP connected. Polling for Dice OTP email...")
+
+    try:
+        deadline = start_time + timeout_seconds
+        recipient_mismatch_logged = False
+        dice_candidate_logged = False
+        while time.time() < deadline:
+            try:
+                mail.select("INBOX")
+                status, msg_ids = mail.search(None, "ALL")
+                if status != "OK" or not msg_ids or not msg_ids[0]:
+                    time.sleep(poll_interval)
+                    continue
+
+                id_list = msg_ids[0].split()
+                dice_candidates = 0
+
+                for msg_id in reversed(id_list[-60:]):
+                    status, msg_data = mail.fetch(msg_id, "(RFC822)")
+                    if status != "OK" or not msg_data or not msg_data[0]:
                         continue
 
-                    id_list = msg_ids[0].split()
-                    dice_candidates = 0
+                    raw_email = msg_data[0][1]
+                    msg = email_lib.message_from_bytes(raw_email)
+                    if not _sender_matches(msg):
+                        continue
 
-                    for mid in reversed(id_list[-60:]):
-                        status, msg_data = mail.fetch(mid, "(RFC822)")
-                        if status != "OK" or not msg_data or not msg_data[0]:
-                            continue
-                        raw = msg_data[0][1]
-                        msg = email_lib.message_from_bytes(raw)
-                        if not _sender_matches(msg):
-                            continue
+                    dice_candidates += 1
 
-                        dice_candidates += 1
-
-                        if recipient_filter:
-                            recipients = _extract_header_recipients(msg)
-                            if recipient_filter not in recipients:
-                                if not recipient_mismatch_logged:
-                                    preview = ", ".join(sorted(recipients)) if recipients else "none"
-                                    log(
-                                        f"Recent DICE email found, but its recipient headers did not include {recipient_filter} "
-                                        f"(saw: {preview}).",
-                                        "warning",
-                                    )
-                                    recipient_mismatch_logged = True
-                                continue
-
-                        date_str = msg.get("Date", "")
-                        if date_str:
-                            try:
-                                email_ts = parsedate_to_datetime(date_str).timestamp()
-                                if email_ts < start_time - 60:
-                                    continue
-                            except Exception:
-                                pass
-
-                        subject = _decode_mime_header(msg.get("Subject", ""))
-                        message_text = _extract_message_text(msg)
-                        otp_code = _extract_otp_code(subject, message_text)
-                        if not otp_code:
+                    if recipient_filter:
+                        recipients = _extract_header_recipients(msg)
+                        if recipient_filter not in recipients:
+                            if not recipient_mismatch_logged:
+                                preview = ", ".join(sorted(recipients)) if recipients else "none"
+                                log(
+                                    f"Recent DICE email found, but its recipient headers did not include {recipient_filter} "
+                                    f"(saw: {preview}).",
+                                    "warning",
+                                )
+                                recipient_mismatch_logged = True
                             continue
 
-                        log(f"OTP code found: {otp_code}")
-                        try:
-                            mail.store(mid, "+FLAGS", "\\Deleted")
-                            mail.expunge()
-                        except Exception:
-                            pass
-                        return otp_code
+                    subject = _decode_mime_header(msg.get("Subject", ""))
+                    message_text = _extract_message_text(msg)
+                    otp_code = _extract_otp_code(subject, message_text)
+                    if not otp_code:
+                        continue
 
-                    if dice_candidates and not dice_candidate_logged:
-                        log(f"Found {dice_candidates} recent DICE email(s) in the inbox. Waiting for a matching OTP...")
-                        dice_candidate_logged = True
+                    # Check that the email is recent
+                    date_str = msg.get("Date", "")
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        email_dt = parsedate_to_datetime(date_str)
+                        email_ts = email_dt.timestamp()
+                        if email_ts < start_time - 60:
+                            continue
+                    except Exception:
+                        pass
 
-                    time.sleep(poll_interval)
+                    log(f"OTP code found: {otp_code}")
 
-                except Exception as exc:
-                    log(f"IMAP poll error: {exc}", "warning")
-                    time.sleep(poll_interval)
+                    try:
+                        mail.store(msg_id, "+FLAGS", "\\Deleted")
+                        mail.expunge()
+                    except Exception:
+                        pass
 
-            log("Timed out waiting for Dice OTP email.", "warning")
-            return None
+                    return otp_code
 
-        finally:
-            try:
-                mail.logout()
-            except Exception:
-                pass
+                if dice_candidates and not dice_candidate_logged:
+                    log(f"Found {dice_candidates} recent DICE email(s) in the inbox. Waiting for a matching OTP...")
+                    dice_candidate_logged = True
+
+            except Exception as exc:
+                log(f"IMAP poll error: {exc}", "warning")
+                time.sleep(poll_interval)
+
+        log("Timed out waiting for Dice OTP email.", "warning")
+        return None
+
     finally:
-        sem.release()
+        try:
+            mail.logout()
+        except Exception:
+            pass
 
 
 def fetch_otp_aycd(
