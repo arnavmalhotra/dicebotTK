@@ -17,7 +17,6 @@
       <nav class="nav-tabs" id="navTabs">
         <button class="nav-btn active" data-page="dashboard">Dashboard</button>
         <button class="nav-btn" data-page="inventory">Inventory</button>
-        <button class="nav-btn" data-page="tasks">Tasks</button>
         <button class="nav-btn" data-page="accounts">Accounts</button>
         <button class="nav-btn" data-page="profiles">Cards</button>
         <button class="nav-btn" data-page="codepools">Code Pools</button>
@@ -74,49 +73,6 @@
           </div>
         </div>
       </section>
-
-      <!-- ── Tasks ─────────────────────────────────────────────────── -->
-      <section class="page" id="page-tasks">
-        <div class="page-header">
-          <div>
-            <h2>Tasks</h2>
-            <p class="muted">Per-account purchase tasks. Only accounts with a valid session can run.</p>
-          </div>
-          <div class="page-actions">
-            <button class="btn btn-ghost" id="refreshTasksBtn">Refresh</button>
-            <button class="btn btn-ghost" id="importTasksBtn">Import CSV</button>
-            <button class="btn btn-ghost" id="exportTasksBtn">Export CSV</button>
-            <button class="btn btn-primary" id="addTaskBtn">Add task</button>
-          </div>
-        </div>
-
-        <div class="accounts-toolbar">
-          <div style="display:flex; align-items:center; gap:8px;">
-            <label style="display:flex; align-items:center; gap:6px; font-size:13px; color:var(--text-muted);">
-              <input type="checkbox" id="selectAllTasks" /> Select all
-            </label>
-          </div>
-          <div class="toolbar-right">
-            <input type="text" id="taskSearch" placeholder="Search event, phone…" />
-          </div>
-        </div>
-
-        <div class="bulk-bar" id="taskBulkBar" hidden>
-          <span id="taskBulkCount"></span>
-          <div class="bulk-actions">
-            <button class="btn btn-primary btn-sm" id="bulkStartTasksBtn">Start</button>
-            <button class="btn btn-danger btn-sm" id="bulkStopTasksBtn">Stop</button>
-            <button class="btn btn-ghost btn-sm" id="bulkEditTasksBtn">Edit…</button>
-            <button class="btn btn-danger btn-sm" id="bulkDeleteTasksBtn">Delete</button>
-            <button class="btn-icon" id="taskBulkClearBtn" title="Clear selection">✕</button>
-          </div>
-        </div>
-
-        <div id="taskGrid" class="task-grid">
-          <div class="empty-state">No tasks yet. Click "Add task" to create one.</div>
-        </div>
-      </section>
-
 
       <!-- ── Inventory ────────────────────────────────────────────── -->
       <section class="page" id="page-inventory">

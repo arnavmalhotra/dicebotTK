@@ -8,7 +8,7 @@ Protocol (JSONL over stdin/stdout):
     Event:    {"type": "log"|"status"|"progress"|"cart_update"|"auth_update",
                "session_id": "...", ...}
 
-Long-running methods (auth.login_one, cart.run, auth.farm, task.run)
+Long-running methods (auth.login_one, cart.run, auth.farm)
 spawn a background thread and return {"ok": true,
 "data": {"session_id": "..."}} immediately. The thread emits events tagged
 with that session id and finishes with a "done" event.
@@ -105,6 +105,56 @@ _STDOUT_LOCK = threading.Lock()
 
 _APPROVAL_TTL_SECONDS = 300
 
+# ── Telemetry (silent — end users never see this) ─────────────────────────
+# These values are baked into the worker so every TK install posts to the
+# same DiceBotWeb endpoint without per-user configuration. Override at
+# runtime by setting TK_TELEMETRY_URL / TK_TELEMETRY_SECRET in the env (used
+# during local dev only — the packaged build has no env override).
+TK_TELEMETRY_URL = os.environ.get(
+    "TK_TELEMETRY_URL",
+    "https://tieroneonly.com/api/tk/telemetry",
+)
+TK_TELEMETRY_SECRET = os.environ.get(
+    "TK_TELEMETRY_SECRET",
+    "a5328ee83a3378ffb2316da716184e6bb8f62f1a2b6b89c6585c978c1f0d24bc",
+)
+
+
+def _post_telemetry_async(*, payload, log, device_id=None) -> None:
+    """Fire-and-forget POST to DiceBotWeb's TK telemetry endpoint.
+
+    Failures are logged at debug level only — purchases must never depend on
+    telemetry succeeding. End users have no visibility into this.
+    """
+    url = TK_TELEMETRY_URL
+    secret = TK_TELEMETRY_SECRET
+    if not url:
+        return
+
+    if device_id:
+        payload = {**payload, "device_id": device_id}
+
+    def _do_post():
+        try:
+            req = requests.post(
+                url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-tk-telemetry-secret": str(secret or ""),
+                    "User-Agent": "DiceBotTK/telemetry",
+                },
+                timeout=8,
+            )
+            if 200 <= req.status_code < 300:
+                return
+            log(f"Telemetry POST returned {req.status_code}.", "debug")
+        except Exception:
+            # Don't surface telemetry failures in the user-facing log.
+            pass
+
+    threading.Thread(target=_do_post, daemon=True).start()
+
 
 def _ts() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -142,7 +192,6 @@ def _session_dir() -> str:
 def m_db_init(_):
     db.init_db()
     db.clear_proxies_without_valid_session()
-    db.purge_ephemeral_tasks()
     return {"ok": True}
 
 
@@ -439,52 +488,6 @@ def m_db_delete_inventory_item(params):
     return {"ok": True}
 
 
-# ── Tasks (persistent + ephemeral) ─────────────────────────────────────────
-
-def m_db_get_tasks(_):
-    return db.get_tasks()
-
-
-def m_db_get_task(params):
-    return db.get_task(int(params["task_id"]))
-
-
-def _task_fields_from_params(params: dict) -> dict:
-    return {
-        "event_url": (params.get("event_url") or "").strip(),
-        "min_price": _optional_float(params.get("min_price") or params.get("target_min_price")),
-        "max_price": _optional_float(params.get("max_price") or params.get("target_max_price")),
-        "presale_code": params.get("presale_code") or "",
-        "ticket_tier": params.get("ticket_tier") or "",
-        "quantity": int(params.get("quantity") or 1),
-        "mode": "manual",  # TK forces manual approval — auto-checkout is disabled
-        "scheduled_at": params.get("scheduled_at") or "",
-        "scheduled_tz": params.get("scheduled_tz") or "",
-        "ephemeral": bool(params.get("ephemeral")),
-    }
-
-
-def m_db_create_task(params):
-    fields = _task_fields_from_params(params)
-    tid = db.create_task(account_id=int(params["account_id"]), **fields)
-    return db.get_task(tid)
-
-
-def m_db_update_task(params):
-    tid = int(params["task_id"])
-    db.update_task(tid, **_task_fields_from_params(params))
-    return db.get_task(tid)
-
-
-def m_db_delete_task(params):
-    db.delete_task(int(params["task_id"]))
-    return {"ok": True}
-
-
-def m_db_import_tasks_file(params):
-    return db.import_tasks_file(str(params["file_path"]))
-
-
 def _optional_float(value):
     if value is None or value == "":
         return None
@@ -522,7 +525,10 @@ def _start_session(kind: str, runner, params) -> str:
     sid = uuid.uuid4().hex[:12]
     stop_evt = threading.Event()
     approve_evt = threading.Event()
-    otp_holder = {"code": None}
+    # `code` is the legacy single-account slot used by _run_login_one.
+    # `by_account` is keyed by account_id and used by _run_auth_farm so each
+    # concurrent account can be given its own manual OTP independently.
+    otp_holder = {"code": None, "by_account": {}}
     driver_holder: dict = {"driver": None, "drivers": [], "lock": threading.Lock()}
 
     with _SESSIONS_LOCK:
@@ -1013,6 +1019,17 @@ def _run_login_one(sid: str, params: dict, stop_evt: threading.Event, otp_holder
     local_driver_ref = {"driver": None}
 
     def _otp_getter():
+        # Prefer per-account slot, fall back to the legacy global slot.
+        aid = account.get("id")
+        if aid is not None:
+            try:
+                pa = otp_holder.get("by_account", {})
+                cached = pa.get(int(aid))
+                if cached:
+                    pa[int(aid)] = None
+                    return cached
+            except (TypeError, ValueError):
+                pass
         code = otp_holder.get("code")
         if code:
             otp_holder["code"] = None
@@ -1289,6 +1306,20 @@ def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder
             log(f"{phone_label}: borrowed auth proxy from pool.")
         elif retained_proxy:
             log(f"{phone_label}: retaining existing proxy from active session.")
+        def _farm_otp_getter():
+            try:
+                pa = otp_holder.get("by_account", {})
+                cached = pa.get(account_id)
+                if cached:
+                    pa[account_id] = None
+                    return cached
+            except (TypeError, AttributeError):
+                pass
+            return None
+
+        def _farm_otp_notifier(**kwargs):
+            _event(sid, type="await_otp", account_id=account_id, **kwargs)
+
         try:
             result = auth_harvester.login_single_account(
                 phone=local_digits,
@@ -1306,6 +1337,8 @@ def _run_auth_farm(sid: str, params: dict, stop_evt: threading.Event, otp_holder
                     local_driver_ref.update(driver=d),
                     _register_driver(driver_holder, d),
                 ),
+                manual_otp_getter=_farm_otp_getter,
+                manual_otp_notifier=_farm_otp_notifier,
             )
             if result.get("ok") and result.get("bearer_token"):
                 db.save_session(account_id, result["bearer_token"], phone=account["phone"])
@@ -1550,7 +1583,7 @@ def _run_cart_inner(
 
     if client.eventIsLocked:
         if not presale_code:
-            return False, "Event is locked — add an access code to this task"
+            return False, "Event is locked — add an access code to this cart"
         if not getattr(client, "accessCodeClaimed", False):
             if scheduled_future:
                 log(f"Event is locked; access code '{presale_code}' claim is deferred until the scheduled sale time.")
@@ -1724,6 +1757,29 @@ def _run_cart_inner(
             )
         except Exception as exc:
             log(f"Inventory record failed (local DB): {exc}", "error")
+
+        _post_telemetry_async(
+            device_id=params.get("telemetry_device_id") or "",
+            log=log,
+            payload={
+                "platform": "dice",
+                "event_name": client.eventName or "",
+                "venue": client.eventVenue or "",
+                "event_date": client.eventDate or "",
+                "profile_name": account.get("name") or account.get("phone") or "",
+                "account_phone": account.get("phone") or "",
+                "quantity": quantity,
+                "ticket_family": client.ticketName or "",
+                "ticket_currency": client.ticketCurrency or "USD",
+                "ticket_price": ticket_price,
+                "total_price": total_price,
+                "event_url": client.eventUrl or event_url,
+                "purchase_id": client.purchaseId or "",
+                "status": "acquired",
+            },
+            log=log,
+        )
+
         emit_update(
             status="purchased",
             purchase_id=client.purchaseId,
@@ -1761,100 +1817,6 @@ def m_cart_run(params):
         raise RuntimeError("Account has no valid session — run Auth Farm first")
     sid = _start_session("cart", _run_cart, params)
     return {"session_id": sid}
-
-
-# ── Task runner (persistent task with DB-backed lifecycle) ────────────────
-
-def _run_task(sid: str, params: dict, stop_evt: threading.Event, otp_holder: dict, driver_holder: dict, approve_evt: threading.Event):
-    """Wrap _run_cart_inner with task-row lifecycle: status updates and last_error."""
-    task = params["task"]
-    account = params["account"]
-    task_id = int(task["id"])
-    log = _log_fn_for(sid)
-
-    db.set_task_status(task_id, "running", session_id=sid)
-    _event(sid, type="task_update", task_id=task_id, status="running")
-
-    merged = {
-        **(params.get("settings") or {}),
-        "event_url": task.get("event_url") or "",
-        "min_price": task.get("min_price"),
-        "max_price": task.get("max_price"),
-        "target_min_price": task.get("min_price"),
-        "target_max_price": task.get("max_price"),
-        "presale_code": task.get("presale_code") or "",
-        "ticket_tier": task.get("ticket_tier") or "",
-        "quantity": int(task.get("quantity") or 1),
-        "mode": "manual",  # TK forces manual approval — auto-checkout is disabled
-        "scheduled_at": task.get("scheduled_at") or "",
-        "scheduled_tz": task.get("scheduled_tz") or "",
-        "capsolver_key": params.get("capsolver_key"),
-        "twocaptcha_key": params.get("twocaptcha_key"),
-        "captchafun_key": params.get("captchafun_key"),
-    }
-
-    try:
-        ok, err = _run_cart_inner(
-            sid, account, merged["event_url"], merged, stop_evt, driver_holder, approve_evt,
-        )
-    except Exception as exc:
-        log(f"Task run failed: {exc}", "error")
-        ok, err = False, str(exc)
-
-    final_status = "completed" if ok else ("stopped" if err == "stopped" else "failed")
-    db.set_task_status(task_id, final_status, session_id="", last_error=(err or "") if not ok else "")
-    _event(sid, type="task_update", task_id=task_id, status=final_status, error=err or None)
-
-    if task.get("ephemeral"):
-        try:
-            db.delete_task(task_id)
-        except Exception:
-            pass
-
-    _event(sid, type="done", ok=ok, error=err or None)
-
-
-def m_task_run(params):
-    _require_license()
-    task = db.get_task(int(params["task_id"]))
-    if not task:
-        raise RuntimeError("Task not found")
-    account_id = int(task["account_id"])
-    if not db.account_has_valid_session(account_id):
-        raise RuntimeError("Account has no valid session — run Auth Farm first")
-    account = db.get_account(account_id)
-    if not account:
-        raise RuntimeError("Account not found")
-    sid = _start_session("task", _run_task, {
-        "task": task,
-        "account": account,
-        "capsolver_key": params.get("capsolver_key"),
-        "twocaptcha_key": params.get("twocaptcha_key"),
-        "captchafun_key": params.get("captchafun_key"),
-        "settings": params.get("settings") or {},
-    })
-    return {"session_id": sid, "task_id": int(task["id"])}
-
-
-def m_task_stop(params):
-    task_id = int(params["task_id"])
-    task = db.get_task(task_id)
-    if not task:
-        return {"ok": False, "error": "task not found"}
-    sid = task.get("session_id") or ""
-    if sid:
-        with _SESSIONS_LOCK:
-            sess = _SESSIONS.get(sid)
-        if sess:
-            sess["stop"].set()
-            for driver in _snapshot_drivers(sess.get("driver_holder") or {}):
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-    db.set_task_status(task_id, "stopped", session_id="", last_error="stopped by user")
-    return {"ok": True}
-
 
 def m_event_preview(params):
     _require_license()
@@ -1898,7 +1860,15 @@ def m_session_set_otp(params):
         sess = _SESSIONS.get(sid)
     if not sess:
         return {"ok": False, "error": "session not found"}
-    sess["otp"]["code"] = params.get("code")
+    code = params.get("code")
+    account_id = params.get("account_id")
+    if account_id is not None:
+        try:
+            sess["otp"]["by_account"][int(account_id)] = code
+        except (TypeError, ValueError):
+            sess["otp"]["code"] = code
+    else:
+        sess["otp"]["code"] = code
     return {"ok": True}
 
 
@@ -1955,20 +1925,12 @@ METHODS = {
     "db.get_session": m_db_get_session,
     "db.get_inventory_items": m_db_get_inventory_items,
     "db.delete_inventory_item": m_db_delete_inventory_item,
-    "db.get_tasks": m_db_get_tasks,
-    "db.get_task": m_db_get_task,
-    "db.create_task": m_db_create_task,
-    "db.update_task": m_db_update_task,
-    "db.delete_task": m_db_delete_task,
-    "db.import_tasks_file": m_db_import_tasks_file,
     "auth.login_one": m_auth_login_one,
     "auth.open_profile": m_auth_open_profile,
     "auth.manual_login_one": m_auth_manual_login_one,
     "auth.refresh_state": m_auth_refresh_state,
     "auth.farm": m_auth_farm,
     "cart.run": m_cart_run,
-    "task.run": m_task_run,
-    "task.stop": m_task_stop,
     "event.preview": m_event_preview,
     "session.stop": m_session_stop,
     "session.approve": m_session_approve,

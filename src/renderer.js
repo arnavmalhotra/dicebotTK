@@ -11,14 +11,11 @@ const state = {
   search: "",
   inventory: [],
   inventorySearch: "",
-  tasks: [],
-  selectedTasks: new Set(),
-  taskSearch: "",
   carts: new Map(), // session_id -> cart info
   payment: { cards: [], pools: [], assignDropdownCardId: null },
   codePools: { pools: [], expanded: new Set(), codesByPool: new Map() },
   proxyPools: { pools: [], expanded: new Set(), proxiesByPool: new Map() },
-  authFarm: { sessionId: null, running: false, accountStatus: new Map(), attempts: [] },
+  authFarm: { sessionId: null, running: false, accountStatus: new Map(), attempts: [], awaitingOtp: new Set() },
   authRefresh: {
     sessionId: null,
     running: false,
@@ -36,11 +33,20 @@ const state = {
 };
 
 function loadSettings() {
+  let s;
   try {
-    return JSON.parse(localStorage.getItem("dicebot.settings") || "{}");
+    s = JSON.parse(localStorage.getItem("dicebot.settings") || "{}");
   } catch {
-    return {};
+    s = {};
   }
+  // Stable per-install UUID so DiceBotWeb telemetry can group / filter by device.
+  if (!s.deviceId) {
+    s.deviceId = (typeof crypto !== "undefined" && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : `dev-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    try { localStorage.setItem("dicebot.settings", JSON.stringify(s)); } catch {}
+  }
+  return s;
 }
 function saveSettings(patch) {
   state.settings = { ...state.settings, ...patch };
@@ -321,7 +327,6 @@ $$("#navTabs .nav-btn").forEach((btn) => {
     if (page === "profiles") refreshPaymentCards();
     if (page === "codepools") refreshCodePools();
     if (page === "proxies") refreshProxyPools();
-    if (page === "tasks") refreshTasks();
   });
 });
 
@@ -1621,14 +1626,52 @@ function renderAuthQueue(accounts) {
     const row = document.createElement("div");
     row.className = "queue-item";
     const status = state.authFarm.accountStatus.get(a.id) || "pending";
+    const showOtp = status === "running" || state.authFarm.awaitingOtp.has(a.id);
+    const waiting = state.authFarm.awaitingOtp.has(a.id);
+    const otpHtml = showOtp ? `
+      <div class="queue-otp" style="display:flex;gap:6px;align-items:center;${waiting ? "outline:1px solid var(--warn);padding:4px 6px;border-radius:6px;" : ""}">
+        <input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="10"
+               placeholder="${waiting ? "OTP needed" : "Manual OTP"}"
+               data-otp-account="${a.id}"
+               style="width:120px;font-family:monospace;" />
+        <button type="button" class="btn btn-ghost btn-sm" data-otp-submit="${a.id}">Submit</button>
+      </div>
+    ` : "";
     row.innerHTML = `
       <div>
         <div>${escapeHtml(a.phone || "")}</div>
         <div class="muted" style="font-size:11px;">${escapeHtml(a.email || "")}</div>
       </div>
+      ${otpHtml}
       <span class="queue-status badge-${statusBadge(status)}">${status}</span>
     `;
     q.appendChild(row);
+  }
+  q.querySelectorAll("[data-otp-submit]").forEach((btn) => {
+    btn.addEventListener("click", () => submitInlineOtp(Number(btn.dataset.otpSubmit)));
+  });
+  q.querySelectorAll("[data-otp-account]").forEach((input) => {
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submitInlineOtp(Number(input.dataset.otpAccount));
+    });
+  });
+}
+
+async function submitInlineOtp(accountId) {
+  const sid = state.authFarm.sessionId;
+  if (!sid) { appendFarmLog("No farm session active — start the farm first.", "warning"); return; }
+  const input = document.querySelector(`[data-otp-account="${accountId}"]`);
+  if (!input) return;
+  const code = String(input.value || "").trim();
+  if (!code) { input.focus(); return; }
+  const r = await api.sessionSetOtp(sid, code, accountId);
+  if (r.ok) {
+    appendFarmLog(`Manual OTP submitted for account ${accountId}: ${code}`);
+    input.value = "";
+    state.authFarm.awaitingOtp.delete(accountId);
+    renderAuthFarm();
+  } else {
+    appendFarmLog(`Failed to submit OTP for account ${accountId}: ${r.error || "unknown"}`, "error");
   }
 }
 function statusBadge(s) {
@@ -1666,7 +1709,6 @@ $("#clearProxyStatsBtn")?.addEventListener("click", clearProxyStats);
 
 $("#exportInventoryBtn")?.addEventListener("click", () => exportInventory("csv"));
 $("#exportInventoryJsonBtn")?.addEventListener("click", () => exportInventory("json"));
-$("#exportTasksBtn")?.addEventListener("click", exportTasks);
 $("#exportAccountsBtn")?.addEventListener("click", exportAccounts);
 
 function appendFarmLog(message, level = "info") {
@@ -1865,31 +1907,6 @@ function exportInventory(format = "csv") {
     { key: "purchase_status", label: "purchase_status" },
   ];
   downloadFile(`inventory-${stamp}.csv`, toCsv(items, cols), "text/csv");
-}
-
-function exportTasks() {
-  const tasks = state.tasks || [];
-  if (!tasks.length) { alert("No tasks to export."); return; }
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const cols = [
-    { key: "id", label: "id" },
-    { key: "account_id", label: "account_id" },
-    { key: "account_phone", label: "account_phone" },
-    { key: "account_email", label: "account_email" },
-    { key: "event_url", label: "event_url" },
-    { key: "ticket_tier", label: "ticket_tier" },
-    { key: "min_price", label: "min_price" },
-    { key: "max_price", label: "max_price" },
-    { key: "quantity", label: "quantity" },
-    { key: "presale_code", label: "presale_code" },
-    { key: "mode", label: "mode" },
-    { key: "scheduled_at", label: "scheduled_at" },
-    { key: "scheduled_tz", label: "scheduled_tz" },
-    { key: "status", label: "status" },
-    { key: "last_error", label: "last_error" },
-    { key: "created_at", label: "created_at" },
-  ];
-  downloadFile(`tasks-${stamp}.csv`, toCsv(tasks, cols), "text/csv");
 }
 
 function exportAccounts() {
@@ -3059,6 +3076,7 @@ async function openCartModal(options = {}) {
           approval_webhook_url: state.settings.approvalWebhookUrl || null,
           approval_poll_url: state.settings.approvalPollUrl || null,
           approval_secret: state.settings.approvalSecret || null,
+          telemetry_device_id: state.settings.deviceId || null,
           approval_poll_interval_seconds: 2,
         };
         closeModal();
@@ -3118,7 +3136,7 @@ async function promptManualOtp(msg) {
       appendFarmLog("Manual OTP cancelled — session will time out.", "warning");
       return;
     }
-    const r = await api.sessionSetOtp(sid, code);
+    const r = await api.sessionSetOtp(sid, code, msg.account_id);
     if (r.ok) appendFarmLog(`Manual OTP submitted (${code}).`);
     else appendFarmLog(`Failed to submit manual OTP: ${r.error || "unknown"}`, "error");
   } finally {
@@ -3143,6 +3161,9 @@ api.onEvent((msg) => {
   }
   if (msg.type === "auth_update") {
     state.authFarm.accountStatus.set(msg.account_id, msg.status);
+    if (msg.status === "ok" || msg.status === "fail") {
+      state.authFarm.awaitingOtp.delete(msg.account_id);
+    }
     recordAuthAttempt(msg);
     refreshAuthFarm();
     if ($("#page-accounts").classList.contains("active")) refreshAccounts();
@@ -3150,7 +3171,18 @@ api.onEvent((msg) => {
     return;
   }
   if (msg.type === "await_otp") {
-    if (msg.status === "waiting") promptManualOtp(msg);
+    if (msg.status === "waiting") {
+      // Farm session: highlight the inline OTP input on the queue card
+      // instead of popping a blocking prompt. Single-login session: keep the
+      // legacy prompt() fallback.
+      if (msg.session_id && msg.session_id === state.authFarm.sessionId && msg.account_id != null) {
+        state.authFarm.awaitingOtp.add(Number(msg.account_id));
+        renderAuthFarm();
+        appendFarmLog(`OTP needed for account ${msg.account_id} — enter it on the queue card.`, "warning");
+      } else {
+        promptManualOtp(msg);
+      }
+    }
     return;
   }
   if (msg.type === "auth_state_update") {
@@ -3260,304 +3292,10 @@ setInterval(() => {
   });
 }, 500);
 
-// ── Tasks page ────────────────────────────────────────────────────────────
-async function refreshTasks() {
-  const r = await api.getTasks();
-  state.tasks = r.ok ? r.data || [] : [];
-  // Drop selections for tasks that no longer exist.
-  const known = new Set(state.tasks.map((t) => t.id));
-  for (const id of [...state.selectedTasks]) if (!known.has(id)) state.selectedTasks.delete(id);
-  renderTasks();
-}
-
-function renderTasks() {
-  const grid = $("#taskGrid");
-  const search = state.taskSearch.toLowerCase();
-  const rows = state.tasks.filter((t) => {
-    if (!search) return true;
-    return (t.account_phone || "").toLowerCase().includes(search) ||
-           (t.event_url || "").toLowerCase().includes(search);
-  });
-  if (!rows.length) {
-    grid.innerHTML = '<div class="empty-state">No tasks yet. Click "Add task" to create one.</div>';
-    renderTaskBulkBar();
-    return;
-  }
-  grid.innerHTML = "";
-  for (const t of rows) grid.appendChild(renderTaskCard(t));
-  renderTaskBulkBar();
-  const all = $("#selectAllTasks");
-  if (all) all.checked = rows.length > 0 && rows.every((t) => state.selectedTasks.has(t.id));
-}
-
-function renderTaskCard(t) {
-  const el = document.createElement("div");
-  const selected = state.selectedTasks.has(t.id);
-  const running = t.status === "running";
-  el.className = "task-card" + (selected ? " selected" : "") + (running ? " running" : "");
-  const sessionOk = t.session_status === "active" || t.session_status === "expiring";
-  const priceRange = (t.min_price != null || t.max_price != null)
-    ? `${t.min_price ?? "?"} – ${t.max_price ?? "?"}`
-    : "any price";
-  const url = (t.event_url || "").trim();
-  const urlShort = url ? url.replace(/^https?:\/\//, "").slice(0, 60) : "— no link —";
-  el.innerHTML = `
-    <div class="task-card-top">
-      <div style="display:flex; gap:10px; align-items:flex-start; min-width:0;">
-        <input type="checkbox" class="task-sel" data-id="${t.id}" ${selected ? "checked" : ""} style="margin-top:3px;" />
-        <div style="min-width:0;">
-          <div class="task-account">${escapeHtml(t.account_phone || "")} <span class="session-dot ${sessionDotClass(t.session_status)}"></span></div>
-          <div class="task-meta">${escapeHtml(urlShort)}</div>
-        </div>
-      </div>
-      <span class="task-status-pill ${running ? "running" : t.status}">${escapeHtml(t.status || "idle")}</span>
-    </div>
-    <div class="task-meta">
-      <div>Tier: ${escapeHtml(t.ticket_tier || "any")} · Qty: ${escapeHtml(String(t.quantity || 1))}</div>
-      <div>Price: ${escapeHtml(priceRange)}${t.presale_code ? ` · Presale: ${escapeHtml(t.presale_code)}` : ""}</div>
-      ${t.scheduled_at ? `<div>Drop: ${escapeHtml(t.scheduled_at.replace("T"," "))} ${escapeHtml(t.scheduled_tz || "")}</div>` : ""}
-      ${t.last_error ? `<div style="color:#fff; margin-top:4px;">Last error: ${escapeHtml(t.last_error)}</div>` : ""}
-      ${!sessionOk ? `<div style="color:var(--text-muted); margin-top:4px;">No valid session — run auth before starting</div>` : ""}
-    </div>
-    <div class="task-actions">
-      <button class="btn btn-primary btn-sm" data-task-action="start" ${running || !sessionOk ? "disabled" : ""}>Start</button>
-      <button class="btn btn-danger btn-sm" data-task-action="stop" ${running ? "" : "disabled"}>Stop</button>
-      <button class="btn btn-ghost btn-sm" data-task-action="edit">Edit</button>
-      <button class="btn btn-ghost btn-sm" data-task-action="delete">Delete</button>
-    </div>
-  `;
-  el.querySelector(".task-sel").addEventListener("change", (e) => {
-    if (e.target.checked) state.selectedTasks.add(t.id);
-    else state.selectedTasks.delete(t.id);
-    renderTasks();
-  });
-  el.querySelectorAll("[data-task-action]").forEach((btn) => {
-    btn.addEventListener("click", () => handleTaskAction(btn.dataset.taskAction, t));
-  });
-  return el;
-}
-
-function renderTaskBulkBar() {
-  const bar = $("#taskBulkBar");
-  const n = state.selectedTasks.size;
-  bar.hidden = n === 0;
-  if (n) $("#taskBulkCount").textContent = `${n} selected`;
-}
-
-async function handleTaskAction(action, task) {
-  if (action === "start") return startTasks([task.id]);
-  if (action === "stop") return stopTasks([task.id]);
-  if (action === "edit") return openTaskModal(task);
-  if (action === "delete") {
-    if (!confirm("Delete this task?")) return;
-    const r = await api.deleteTask(task.id);
-    if (r.ok) refreshTasks();
-    else alert("Delete failed: " + r.error);
-  }
-}
-
-async function startTasks(ids) {
-  if (!ids.length) return;
-  const common = {
-    capsolver_key: state.settings.capsolverKey || null,
-    twocaptcha_key: state.settings.twocaptchaKey || null,
-  };
-  const failures = [];
-  await Promise.all(ids.map(async (tid) => {
-    const r = await api.taskRun({ task_id: tid, ...common });
-    if (!r.ok) failures.push(`#${tid}: ${r.error}`);
-  }));
-  refreshTasks();
-  if (failures.length) alert("Some tasks did not start:\n" + failures.join("\n"));
-}
-
-async function stopTasks(ids) {
-  if (!ids.length) return;
-  await Promise.all(ids.map((tid) => api.taskStop(tid)));
-  refreshTasks();
-}
-
-$("#addTaskBtn").addEventListener("click", () => openTaskModal(null));
-$("#refreshTasksBtn").addEventListener("click", refreshTasks);
-$("#importTasksBtn").addEventListener("click", async () => {
-  const r = await api.importTasksFile();
-  if (r.ok) {
-    showImportResultModal({
-      title: "Task import result",
-      summary: [
-        `Created: ${r.data.created}`,
-        `Skipped: ${r.data.skipped}`,
-      ],
-      log: r.data.log || [],
-      columns: ["row", "outcome", "email", "event_url", "reason"],
-    });
-    refreshTasks();
-  } else if (r.error !== "Cancelled") {
-    alert("Import failed: " + r.error);
-  }
-});
-$("#taskSearch").addEventListener("input", (e) => { state.taskSearch = e.target.value; renderTasks(); });
-
-$("#selectAllTasks").addEventListener("change", (e) => {
-  if (e.target.checked) state.tasks.forEach((t) => state.selectedTasks.add(t.id));
-  else state.selectedTasks.clear();
-  renderTasks();
-});
-$("#taskBulkClearBtn").addEventListener("click", () => { state.selectedTasks.clear(); renderTasks(); });
-$("#bulkStartTasksBtn").addEventListener("click", () => startTasks([...state.selectedTasks]));
-$("#bulkStopTasksBtn").addEventListener("click", () => stopTasks([...state.selectedTasks]));
-$("#bulkDeleteTasksBtn").addEventListener("click", async () => {
-  const ids = [...state.selectedTasks];
-  if (!ids.length) return;
-  if (!confirm(`Delete ${ids.length} task(s)?`)) return;
-  await Promise.all(ids.map((id) => api.deleteTask(id)));
-  state.selectedTasks.clear();
-  refreshTasks();
-});
-$("#bulkEditTasksBtn").addEventListener("click", () => openBulkEditTasksModal());
-
-async function openTaskModal(task) {
-  const isEdit = !!task;
-  let accountOptions = "";
-  if (!isEdit) {
-    const r = await api.getAccounts(null);
-    const accts = r.ok ? r.data || [] : [];
-    accountOptions = accts
-      .map((a) => `<option value="${a.id}">${escapeHtml(a.phone || "")} — ${escapeHtml(a.email || "")}</option>`)
-      .join("");
-  }
-  const t = task || {};
-  openModal({
-    title: isEdit ? `Edit task — ${escapeHtml(t.account_phone || "")}` : "Add task",
-    bodyHtml: `
-      <div class="form-grid">
-        ${isEdit ? "" : `<label><span>Account</span><select id="t_account">${accountOptions}</select></label>`}
-        <label><span>Event URL (link)</span><input id="t_url" value="${escapeHtml(t.event_url || "")}" placeholder="https://dice.fm/event/..." /></label>
-        <label><span>Presale code (optional)</span><input id="t_code" value="${escapeHtml(t.presale_code || "")}" /></label>
-        <label><span>Preferred tier (fuzzy)</span><input id="t_tier" value="${escapeHtml(t.ticket_tier || state.settings.defaultTier || "")}" /></label>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <label><span>Min price</span><input id="t_min" type="number" step="0.01" value="${t.min_price ?? state.settings.defaultMinPrice ?? ""}" /></label>
-          <label><span>Max price</span><input id="t_max" type="number" step="0.01" value="${t.max_price ?? state.settings.defaultMaxPrice ?? ""}" /></label>
-        </div>
-        <label><span>Quantity</span><input id="t_qty" type="number" min="1" step="1" value="${t.quantity ?? 1}" /></label>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <label><span>Scheduled drop (leave blank to run immediately)</span>
-            <input id="t_sched" type="datetime-local" step="1" value="${escapeHtml(t.scheduled_at || "")}" />
-          </label>
-          <label><span>Timezone</span>
-            <select id="t_tz">${tzSelectOptions(t.scheduled_tz || "")}</select>
-          </label>
-        </div>
-        <p class="muted" style="font-size:11px; margin:-6px 0 0;">At T-3s the task starts polling tiers; the cart fires at the exact scheduled instant.</p>
-      </div>
-    `,
-    footerHtml: `<button class="btn btn-ghost" data-close>Cancel</button>
-                 <button class="btn btn-primary" id="t_save">${isEdit ? "Save" : "Create"}</button>`,
-    onMount: () => {
-      $("#t_save").addEventListener("click", async () => {
-        const fields = {
-          event_url: $("#t_url").value.trim(),
-          presale_code: $("#t_code").value.trim(),
-          ticket_tier: $("#t_tier").value.trim(),
-          min_price: $("#t_min").value,
-          max_price: $("#t_max").value,
-          quantity: parseInt($("#t_qty").value, 10) || 1,
-          mode: "manual",
-          scheduled_at: $("#t_sched").value.trim(),
-          scheduled_tz: $("#t_sched").value.trim() ? $("#t_tz").value : "",
-        };
-        let r;
-        if (isEdit) {
-          r = await api.updateTask(t.id, fields);
-        } else {
-          const aid = parseInt($("#t_account").value, 10);
-          if (!aid) { alert("Pick an account."); return; }
-          r = await api.createTask({ account_id: aid, ...fields });
-        }
-        if (r.ok) { closeModal(); refreshTasks(); }
-        else alert("Save failed: " + r.error);
-      });
-    },
-  });
-}
-
-function openBulkEditTasksModal() {
-  const ids = [...state.selectedTasks];
-  if (!ids.length) return;
-  openModal({
-    title: `Bulk edit ${ids.length} task(s)`,
-    bodyHtml: `
-      <p class="muted" style="font-size:12px; margin:0 0 10px;">Only filled fields will be applied; blank fields keep their current value.</p>
-      <div class="form-grid">
-        <label><span>Event URL (link)</span><input id="bt_url" placeholder="leave blank to keep" /></label>
-        <label><span>Presale code</span><input id="bt_code" placeholder="leave blank to keep" /></label>
-        <label><span>Preferred tier</span><input id="bt_tier" placeholder="leave blank to keep" /></label>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <label><span>Min price</span><input id="bt_min" type="number" step="0.01" /></label>
-          <label><span>Max price</span><input id="bt_max" type="number" step="0.01" /></label>
-        </div>
-        <label><span>Quantity</span><input id="bt_qty" type="number" min="1" step="1" /></label>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-          <label><span>Scheduled drop</span><input id="bt_sched" type="datetime-local" step="1" /></label>
-          <label><span>Timezone</span><select id="bt_tz"><option value="">(keep)</option>${tzSelectOptions("")}</select></label>
-        </div>
-        <p class="muted" style="font-size:11px; margin:-6px 0 0;">Clear-schedule: type the literal word <code>clear</code> into "Scheduled drop" to remove it on every selected task.</p>
-      </div>
-    `,
-    footerHtml: `<button class="btn btn-ghost" data-close>Cancel</button>
-                 <button class="btn btn-primary" id="bt_save">Apply to ${ids.length}</button>`,
-    onMount: () => {
-      $("#bt_save").addEventListener("click", async () => {
-        const patches = {};
-        const url = $("#bt_url").value.trim(); if (url) patches.event_url = url;
-        const code = $("#bt_code").value.trim(); if (code) patches.presale_code = code;
-        const tier = $("#bt_tier").value.trim(); if (tier) patches.ticket_tier = tier;
-        const min = $("#bt_min").value; if (min !== "") patches.min_price = min;
-        const max = $("#bt_max").value; if (max !== "") patches.max_price = max;
-        const qty = $("#bt_qty").value; if (qty !== "") patches.quantity = parseInt(qty, 10) || 1;
-        const schedRaw = $("#bt_sched").value.trim();
-        const tzRaw = $("#bt_tz").value;
-        let clearSched = false;
-        if (schedRaw.toLowerCase() === "clear") {
-          clearSched = true;
-        } else if (schedRaw) {
-          patches.scheduled_at = schedRaw;
-          patches.scheduled_tz = tzRaw || browserTz();
-        } else if (tzRaw) {
-          patches.scheduled_tz = tzRaw;
-        }
-        if (!clearSched && !Object.keys(patches).length) { closeModal(); return; }
-
-        // Merge each existing task with patches, then update.
-        const byId = new Map(state.tasks.map((t) => [t.id, t]));
-        await Promise.all(ids.map((id) => {
-          const cur = byId.get(id);
-          if (!cur) return Promise.resolve();
-          const merged = {
-            event_url: patches.event_url ?? cur.event_url ?? "",
-            presale_code: patches.presale_code ?? cur.presale_code ?? "",
-            ticket_tier: patches.ticket_tier ?? cur.ticket_tier ?? "",
-            min_price: patches.min_price ?? cur.min_price ?? "",
-            max_price: patches.max_price ?? cur.max_price ?? "",
-            quantity: patches.quantity ?? cur.quantity ?? 1,
-            mode: "manual",
-            scheduled_at: clearSched ? "" : (patches.scheduled_at ?? cur.scheduled_at ?? ""),
-            scheduled_tz: clearSched ? "" : (patches.scheduled_tz ?? cur.scheduled_tz ?? ""),
-          };
-          return api.updateTask(id, merged);
-        }));
-        closeModal();
-        refreshTasks();
-      });
-    },
-  });
-}
-
 // ── Init ──────────────────────────────────────────────────────────────────
 hydrateSettingsForm();
 refreshDashboard();
 refreshInventory();
-refreshTasks();
 refreshProxyPools();
 api.getUpdateState().then((res) => {
   if (res.ok) setUpdateState(res.data);
