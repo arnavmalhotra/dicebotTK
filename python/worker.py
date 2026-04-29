@@ -1777,7 +1777,6 @@ def _run_cart_inner(
                 "purchase_id": client.purchaseId or "",
                 "status": "acquired",
             },
-            log=log,
         )
 
         emit_update(
