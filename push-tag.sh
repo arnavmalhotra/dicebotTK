@@ -5,6 +5,11 @@ TAG_PREFIX="${TAG_PREFIX:-v}"
 REGISTER_DELAY_SECONDS="${REGISTER_DELAY_SECONDS:-15}"
 POLL_SECONDS="${POLL_SECONDS:-20}"
 EMPTY_POLLS_BEFORE_FAIL="${EMPTY_POLLS_BEFORE_FAIL:-6}"
+VISIBILITY_SETTLE_SECONDS="${VISIBILITY_SETTLE_SECONDS:-6}"
+PUSH_RETRY_ATTEMPTS="${PUSH_RETRY_ATTEMPTS:-5}"
+PUSH_RETRY_INITIAL_SECONDS="${PUSH_RETRY_INITIAL_SECONDS:-5}"
+VISIBILITY_RETRY_ATTEMPTS="${VISIBILITY_RETRY_ATTEMPTS:-6}"
+VISIBILITY_RETRY_INITIAL_SECONDS="${VISIBILITY_RETRY_INITIAL_SECONDS:-4}"
 API_ACCEPT_HEADER="Accept: application/vnd.github+json"
 API_VERSION_HEADER="X-GitHub-Api-Version: 2022-11-28"
 
@@ -32,15 +37,26 @@ api() {
 
 parse_repo_from_remote() {
   local remote_url="$1"
-  local stripped="${remote_url%.git}"
-  case "$stripped" in
-    https://github.com/*)
-      echo "${stripped#https://github.com/}"; return 0 ;;
-    git@github.com:*)
-      echo "${stripped#git@github.com:}"; return 0 ;;
-    ssh://git@github.com/*)
-      echo "${stripped#ssh://git@github.com/}"; return 0 ;;
-  esac
+  local path=""
+
+  remote_url="${remote_url%/}"
+  remote_url="${remote_url%.git}"
+
+  if [[ "$remote_url" =~ ^https://github\.com/(.+)$ ]]; then
+    path="${BASH_REMATCH[1]}"
+  elif [[ "$remote_url" =~ ^git@github\.com:(.+)$ ]]; then
+    path="${BASH_REMATCH[1]}"
+  elif [[ "$remote_url" =~ ^ssh://git@github\.com/(.+)$ ]]; then
+    path="${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+
+  if [[ "$path" =~ ^([^/]+)/([^/]+)$ ]]; then
+    echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    return 0
+  fi
+
   return 1
 }
 
@@ -78,6 +94,42 @@ set_visibility() {
   api --method PATCH "/repos/$REPO" -f "visibility=$visibility" >/dev/null
 }
 
+set_visibility_with_retry() {
+  local visibility="$1"
+  local attempts="$VISIBILITY_RETRY_ATTEMPTS"
+  local delay="$VISIBILITY_RETRY_INITIAL_SECONDS"
+  local i
+  for ((i=1; i<=attempts; i++)); do
+    if set_visibility "$visibility" 2>/dev/null; then
+      return 0
+    fi
+    if [[ $i -lt $attempts ]]; then
+      echo "  visibility flip to '$visibility' failed (attempt $i/$attempts); retrying in ${delay}s..." >&2
+      sleep "$delay"
+      delay=$((delay * 2))
+    fi
+  done
+  return 1
+}
+
+git_push_with_retry() {
+  local ref="$1"
+  local attempts="$PUSH_RETRY_ATTEMPTS"
+  local delay="$PUSH_RETRY_INITIAL_SECONDS"
+  local i
+  for ((i=1; i<=attempts; i++)); do
+    if git push origin "$ref"; then
+      return 0
+    fi
+    if [[ $i -lt $attempts ]]; then
+      echo "  push of '$ref' failed (attempt $i/$attempts); retrying in ${delay}s..." >&2
+      sleep "$delay"
+      delay=$((delay * 2))
+    fi
+  done
+  return 1
+}
+
 cleanup() {
   local status="$1"
   trap - EXIT INT TERM
@@ -85,7 +137,7 @@ cleanup() {
 
   if [[ "$VISIBILITY_CHANGED" == "1" && -n "$ORIGINAL_VISIBILITY" ]]; then
     echo "→ Restoring repo visibility to ${ORIGINAL_VISIBILITY}..."
-    if set_visibility "$ORIGINAL_VISIBILITY"; then
+    if set_visibility_with_retry "$ORIGINAL_VISIBILITY"; then
       echo "✓ Repo restored to ${ORIGINAL_VISIBILITY}"
     else
       echo "warning: failed to restore repo visibility to ${ORIGINAL_VISIBILITY}" >&2
@@ -187,12 +239,19 @@ echo "→ Current visibility: $ORIGINAL_VISIBILITY"
 echo "→ New package version: $NEW_VERSION"
 echo "→ Release tag: $TAG"
 echo "→ Making repo public..."
-set_visibility public
+if ! set_visibility_with_retry public; then
+  die "could not flip repo visibility to public"
+fi
 VISIBILITY_CHANGED=1
+
+echo "→ Waiting ${VISIBILITY_SETTLE_SECONDS}s for GitHub to propagate the visibility change to git endpoints..."
+sleep "$VISIBILITY_SETTLE_SECONDS"
 
 echo "→ Creating and pushing tag $TAG..."
 git tag "$TAG"
-git push origin "$TAG"
+if ! git_push_with_retry "$TAG"; then
+  die "failed to push tag $TAG after $PUSH_RETRY_ATTEMPTS attempts"
+fi
 
 echo "→ Waiting ${REGISTER_DELAY_SECONDS}s for workflows to register..."
 sleep "$REGISTER_DELAY_SECONDS"
