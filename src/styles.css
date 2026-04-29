@@ -326,8 +326,8 @@ body {
 .cart-countdown.warn { color: var(--warn); }
 .cart-countdown.danger { color: var(--danger); animation: pulse 1s infinite; }
 @keyframes pulse { 50% { opacity: 0.5; } }
-.cart-actions { display: flex; gap: 8px; }
-.cart-actions .btn { flex: 1; }
+.cart-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.cart-actions .btn { flex: 1 1 auto; white-space: nowrap; padding-left: 10px; padding-right: 10px; }
 .cart-log-pane {
   margin-top: 6px;
   max-height: 180px;
