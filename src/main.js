@@ -407,6 +407,7 @@ function registerIpc() {
     ["db:get-card-labels", "db.get_card_labels"],
     ["db:get-assigned-cards-for-account", "db.get_assigned_cards_for_account"],
     ["db:bulk-account-cards-by-label", "db.bulk_account_cards_by_label"],
+    ["db:get-all-assigned-cards", "db.get_all_assigned_cards"],
     ["db:bulk-add-payment-cards", "db.bulk_add_payment_cards"],
     ["db:get-code-pools", "db.get_code_pools"],
     ["db:create-code-pool", "db.create_code_pool"],

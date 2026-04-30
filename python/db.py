@@ -459,10 +459,76 @@ def bulk_account_cards_by_label(account_ids: list[int], label: str) -> dict[int,
     return result
 
 
-def bulk_add_payment_cards(rows: list[dict]) -> dict:
+def _normalize_phone_for_match(s: str) -> str:
+    """Reduce a phone number to its last 10 digits for matching.
+
+    Handles `+13306346924`, `3306346924`, `(330) 634-6924`, `330-634-6924` etc.
+    Last 10 digits is the right grain for US/CA — country code differences
+    don't break the match. Returns "" if there aren't 10 digits available, in
+    which case we skip matching (better no-match than a false positive).
+    """
+    if not s:
+        return ""
+    digits = "".join(ch for ch in str(s) if ch.isdigit())
+    return digits[-10:] if len(digits) >= 10 else ""
+
+
+def _find_account_id_for_card(billing_phone: str, billing_email: str) -> tuple[int | None, int]:
+    """Return (account_id, match_count). account_id is set only when exactly
+    one account matches; match_count tells the caller why nothing was assigned
+    (0 = no match, 2+ = ambiguous so we refuse to guess).
+    """
+    norm_phone = _normalize_phone_for_match(billing_phone)
+    norm_email = (billing_email or "").strip().lower()
+    if not norm_phone and not norm_email:
+        return None, 0
+
+    conn = _connect()
+    matches: list[int] = []
+    try:
+        # Phone match wins (more specific). The LIKE pattern here is a cheap
+        # filter on the normalized last-10 digits — cheaper than re-normalizing
+        # every account.phone in Python.
+        if norm_phone:
+            rows = conn.execute(
+                "SELECT id, phone FROM accounts WHERE phone LIKE ?",
+                (f"%{norm_phone}",),
+            ).fetchall()
+            for r in rows:
+                if _normalize_phone_for_match(r["phone"]) == norm_phone:
+                    matches.append(int(r["id"]))
+        if not matches and norm_email:
+            rows = conn.execute(
+                "SELECT id FROM accounts WHERE LOWER(email) = ?",
+                (norm_email,),
+            ).fetchall()
+            matches = [int(r["id"]) for r in rows]
+    finally:
+        conn.close()
+
+    unique = list(dict.fromkeys(matches))
+    if len(unique) == 1:
+        return unique[0], 1
+    return None, len(unique)
+
+
+def bulk_add_payment_cards(rows: list[dict], auto_assign: bool = False) -> dict:
     """Import card rows. Each row creates a fresh card. The 'label' column names a pool
-    (auto-created if it doesn't exist). Returns {added, errors}."""
+    (auto-created if it doesn't exist).
+
+    If auto_assign is True, after each card is created the importer looks up an
+    account whose phone (last 10 digits) matches billing_phone OR whose email
+    (case-insensitive) matches billing_email, and assigns the card to it. A
+    card is only assigned when exactly one account matches; multi-match rows
+    are reported as `ambiguous` so the user can resolve them by hand.
+
+    Returns {added, errors, assigned, unmatched, ambiguous} where the latter
+    three are populated only when auto_assign is on.
+    """
     added = 0
+    assigned = 0
+    unmatched: list[dict] = []
+    ambiguous: list[dict] = []
     errors: list[dict] = []
     for idx, row in enumerate(rows or []):
         cleaned = {
@@ -478,16 +544,18 @@ def bulk_add_payment_cards(rows: list[dict]) -> dict:
         if not label:
             errors.append({"row": idx + 1, "error": "Missing label / pool"})
             continue
+        billing_email = _col(cleaned, "billingemail", "email")
+        billing_phone = _col(cleaned, "billingphone", "phone", "phonenumber")
         try:
-            add_payment_card(
+            card_id = add_payment_card(
                 label=label,
                 card_number=card_number,
                 card_exp_month=_col(cleaned, "cardexpmonth", "expmonth"),
                 card_exp_year=_col(cleaned, "cardexpyear", "expyear"),
                 card_cvv=_col(cleaned, "cvv", "cvc"),
                 billing_name=_col(cleaned, "billingname", "fullname", "nameoncard"),
-                billing_email=_col(cleaned, "billingemail", "email"),
-                billing_phone=_col(cleaned, "billingphone", "phone", "phonenumber"),
+                billing_email=billing_email,
+                billing_phone=billing_phone,
                 billing_postal=_col(
                     cleaned,
                     "billingpostal", "billingpostalcode", "billingzip",
@@ -498,7 +566,25 @@ def bulk_add_payment_cards(rows: list[dict]) -> dict:
             added += 1
         except Exception as exc:
             errors.append({"row": idx + 1, "error": str(exc)})
-    return {"added": added, "errors": errors}
+            continue
+
+        if auto_assign:
+            account_id, match_count = _find_account_id_for_card(billing_phone, billing_email)
+            if account_id is not None:
+                assign_card(account_id, card_id)
+                assigned += 1
+            elif match_count == 0:
+                unmatched.append({"row": idx + 1, "billing_phone": billing_phone, "billing_email": billing_email})
+            else:
+                ambiguous.append({"row": idx + 1, "match_count": match_count, "billing_phone": billing_phone, "billing_email": billing_email})
+
+    return {
+        "added": added,
+        "errors": errors,
+        "assigned": assigned,
+        "unmatched": unmatched,
+        "ambiguous": ambiguous,
+    }
 
 
 # ── Code pools (presale / access codes) ───────────────────────────────────
@@ -776,6 +862,34 @@ def get_account(account_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+def get_account_id_by_phone(phone: str) -> int | None:
+    if not phone:
+        return None
+    conn = _connect()
+    row = conn.execute("SELECT id FROM accounts WHERE phone = ?", (phone,)).fetchone()
+    conn.close()
+    return int(row["id"]) if row else None
+
+
+def get_all_assigned_cards() -> dict[int, list[dict]]:
+    """Return {account_id: [card_dict_with_label, ...]} for every assignment."""
+    conn = _connect()
+    rows = conn.execute("""
+        SELECT a.account_id, c.*, p.name AS label
+        FROM account_card_assignments a
+        INNER JOIN payment_cards c ON c.id = a.card_id
+        LEFT JOIN payment_pools p ON p.id = c.pool_id
+        ORDER BY a.account_id, p.name, c.id
+    """).fetchall()
+    conn.close()
+    result: dict[int, list[dict]] = {}
+    for r in rows:
+        d = dict(r)
+        aid = int(d.pop("account_id"))
+        result.setdefault(aid, []).append(d)
+    return result
+
+
 def add_account(
     name: str, phone: str, email: str = "",
     card_number: str = "", card_exp_month: str = "", card_exp_year: str = "", card_cvv: str = "",
@@ -858,42 +972,142 @@ def _country(val):
 
 
 def _import_rows(rows: list[dict], group_id: int | None = None) -> int:
-    """Import a list of dicts (from CSV or XLSX). Returns count imported."""
-    count = 0
+    """Import a list of dicts (from CSV or XLSX). Returns count of accounts touched.
+
+    Format: one row per (account, card) pair.
+    - Rows without a `card_label` column carry the account's default card (lands
+      in accounts.card_number) — this matches every legacy CSV format.
+    - Rows with a non-empty `card_label` create a labeled pool card and assign
+      it to the account; pool is auto-created on first sighting.
+    - Multiple rows for the same phone are folded into a single account: the
+      first row supplies account-level fields, every row's card data is added.
+
+    Sessions are preserved on re-import: existing accounts are UPDATEd by phone
+    rather than INSERT-OR-REPLACEd, so account_id (and its FK-linked sessions
+    + assigned cards) survives. Labeled-card adds are idempotent on
+    (label, card_number).
+    """
+    from collections import OrderedDict
+
+    by_phone: "OrderedDict[str, list[dict]]" = OrderedDict()
     for row in rows:
         cleaned = {k.strip().lower().replace(" ", "").replace("_", ""): str(v).strip() for k, v in row.items() if v}
         phone = _col(cleaned, "phone", "phonenumber")
         if not phone:
             continue
-        email = _col(cleaned, "email", "diceemail", "billingemail")
-        add_account(
-            name=_col(cleaned, "profilename", "profile", "account") or email.split("@")[0] or phone,
-            phone=phone, email=email,
-            card_number=_col(cleaned, "cardnumber", "card"),
-            card_exp_month=_col(cleaned, "cardexpmonth", "expmonth"),
-            card_exp_year=_col(cleaned, "cardexpyear", "expyear"),
-            card_cvv=_col(cleaned, "cvv", "cvc"),
-            billing_name=_col(cleaned, "billingname", "name", "fullname"),
-            billing_email=_col(cleaned, "billingemail") or email,
-            billing_phone=_col(cleaned, "billingphone") or phone,
-            billing_postal=_col(
-                cleaned,
-                "billingpostal",
-                "billingpostalcode",
-                "billingzip",
-                "postal",
-                "zip",
-                "zipcode",
-                "postalcode",
-            ),
-            billing_country=_country(_col(cleaned, "country", "billingcountry") or "US"),
-            proxy=_col(cleaned, "proxy"),
-            aycd_key=_col(cleaned, "aycdkey", "aycd", "aycdapikey"),
-            imap_email=_col(cleaned, "gmailemail", "imapemail", "otpemail") or email,
-            imap_password=_col(cleaned, "gmailapppassword", "imappassword", "gmailpassword", "otppassword"),
-            group_id=group_id,
+        by_phone.setdefault(phone, []).append(cleaned)
+
+    def _billing_postal(r):
+        return _col(
+            r,
+            "billingpostal",
+            "billingpostalcode",
+            "billingzip",
+            "postal",
+            "zip",
+            "zipcode",
+            "postalcode",
         )
+
+    count = 0
+    for phone, group in by_phone.items():
+        # The "default-card row" is the first row (for this phone) that has no
+        # card_label set. Account-level fields and the default card_number are
+        # taken from it. If every row has a label, account fields come from
+        # the first row and the account has no default card_number on file.
+        default_row = next(
+            (r for r in group if not _col(r, "cardlabel", "label")),
+            group[0],
+        )
+        carries_default_card = not _col(default_row, "cardlabel", "label")
+        email = _col(default_row, "email", "diceemail", "billingemail")
+
+        existing_id = get_account_id_by_phone(phone)
+
+        if existing_id is None:
+            account_id = add_account(
+                name=_col(default_row, "profilename", "profile", "account") or (email.split("@")[0] if email else "") or phone,
+                phone=phone,
+                email=email,
+                card_number=_col(default_row, "cardnumber", "card") if carries_default_card else "",
+                card_exp_month=_col(default_row, "cardexpmonth", "expmonth") if carries_default_card else "",
+                card_exp_year=_col(default_row, "cardexpyear", "expyear") if carries_default_card else "",
+                card_cvv=_col(default_row, "cvv", "cvc") if carries_default_card else "",
+                billing_name=_col(default_row, "billingname", "name", "fullname"),
+                billing_email=_col(default_row, "billingemail") or email,
+                billing_phone=_col(default_row, "billingphone") or phone,
+                billing_postal=_billing_postal(default_row),
+                billing_country=_country(_col(default_row, "country", "billingcountry") or "US"),
+                proxy=_col(default_row, "proxy"),
+                aycd_key=_col(default_row, "aycdkey", "aycd", "aycdapikey"),
+                imap_email=_col(default_row, "gmailemail", "imapemail", "otpemail") or email,
+                imap_password=_col(default_row, "gmailapppassword", "imappassword", "gmailpassword", "otppassword"),
+                group_id=group_id,
+            )
+        else:
+            account_id = existing_id
+            # UPSERT: only overwrite fields where the CSV has a non-empty value
+            # so blank cells never wipe data the user already has on file.
+            updates: dict = {}
+            def _maybe(field, val):
+                if val:
+                    updates[field] = val
+
+            _maybe("name", _col(default_row, "profilename", "profile", "account"))
+            _maybe("email", email)
+            if carries_default_card:
+                _maybe("card_number", _col(default_row, "cardnumber", "card"))
+                _maybe("card_exp_month", _col(default_row, "cardexpmonth", "expmonth"))
+                _maybe("card_exp_year", _col(default_row, "cardexpyear", "expyear"))
+                _maybe("card_cvv", _col(default_row, "cvv", "cvc"))
+            _maybe("billing_name", _col(default_row, "billingname", "name", "fullname"))
+            _maybe("billing_email", _col(default_row, "billingemail"))
+            _maybe("billing_phone", _col(default_row, "billingphone"))
+            _maybe("billing_postal", _billing_postal(default_row))
+            country_raw = _col(default_row, "country", "billingcountry")
+            if country_raw:
+                _maybe("billing_country", _country(country_raw))
+            _maybe("proxy", _col(default_row, "proxy"))
+            _maybe("aycd_key", _col(default_row, "aycdkey", "aycd", "aycdapikey"))
+            _maybe("imap_email", _col(default_row, "gmailemail", "imapemail", "otpemail"))
+            _maybe("imap_password", _col(default_row, "gmailapppassword", "imappassword", "gmailpassword", "otppassword"))
+            if group_id is not None:
+                updates["group_id"] = group_id
+            if updates:
+                update_account(account_id, **updates)
         count += 1
+
+        # Labeled cards: idempotent on (label, card_number) so re-importing the
+        # same export is a no-op rather than a duplicate-card spree.
+        existing_pairs = {
+            ((c.get("label") or ""), (c.get("card_number") or ""))
+            for c in (get_assigned_cards_for_account(account_id) or [])
+        }
+        for r in group:
+            label = _col(r, "cardlabel", "label")
+            card_number = _col(r, "cardnumber", "card")
+            if not (label and card_number):
+                continue
+            if (label, card_number) in existing_pairs:
+                continue
+            try:
+                card_id = add_payment_card(
+                    label=label,
+                    card_number=card_number,
+                    card_exp_month=_col(r, "cardexpmonth", "expmonth"),
+                    card_exp_year=_col(r, "cardexpyear", "expyear"),
+                    card_cvv=_col(r, "cvv", "cvc"),
+                    billing_name=_col(r, "billingname", "name", "fullname"),
+                    billing_email=_col(r, "billingemail") or email,
+                    billing_phone=_col(r, "billingphone") or phone,
+                    billing_postal=_billing_postal(r),
+                    billing_country=_country(_col(r, "country", "billingcountry") or "US"),
+                )
+                assign_card(account_id, card_id)
+                existing_pairs.add((label, card_number))
+            except Exception:
+                # Skip a single bad card row but keep importing the rest.
+                continue
     return count
 
 

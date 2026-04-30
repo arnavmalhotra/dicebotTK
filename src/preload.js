@@ -32,7 +32,8 @@ contextBridge.exposeInMainWorld("api", {
   getCardLabels: invoke("db:get-card-labels"),
   getAssignedCardsForAccount: (account_id) => ipcRenderer.invoke("db:get-assigned-cards-for-account", { account_id }),
   bulkAccountCardsByLabel: (account_ids, label) => ipcRenderer.invoke("db:bulk-account-cards-by-label", { account_ids, label }),
-  bulkAddPaymentCards: (rows) => ipcRenderer.invoke("db:bulk-add-payment-cards", { rows }),
+  getAllAssignedCards: invoke("db:get-all-assigned-cards"),
+  bulkAddPaymentCards: (rows, auto_assign = false) => ipcRenderer.invoke("db:bulk-add-payment-cards", { rows, auto_assign }),
 
   // Code pools (drop access / presale codes)
   getCodePools: invoke("db:get-code-pools"),

@@ -354,8 +354,17 @@ def m_db_bulk_account_cards_by_label(params):
     return db.bulk_account_cards_by_label(ids, params.get("label") or "")
 
 
+def m_db_get_all_assigned_cards(_):
+    # Stringify keys so JSON round-trip preserves the account_id mapping cleanly.
+    raw = db.get_all_assigned_cards()
+    return {str(aid): cards for aid, cards in raw.items()}
+
+
 def m_db_bulk_add_payment_cards(params):
-    return db.bulk_add_payment_cards(params.get("rows") or [])
+    return db.bulk_add_payment_cards(
+        params.get("rows") or [],
+        auto_assign=bool(params.get("auto_assign")),
+    )
 
 
 def m_db_get_code_pools(_):
@@ -488,6 +497,83 @@ def _optional_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _resolve_account_card(account: dict, log) -> tuple[dict | None, str]:
+    """Pick the card to charge for this account.
+
+    Returns (card_dict, error). On success card_dict has card_number /
+    card_exp_month / card_exp_year / card_cvv / billing_*; error is "".
+    On failure card_dict is None and error explains what the user should
+    do (account has no default card and either zero or multiple assigned
+    cards across labels).
+
+    Resolution order:
+      1. account.card_number set -> use the account row as-is.
+      2. account.card_number empty + exactly one assigned card across
+         all labels -> use that card (logged loudly with label + last4).
+      3. zero or multiple assigned cards -> hard fail with a message
+         that tells the user exactly which fix to apply.
+
+    The renderer's "Card label" picker already overrides account.* with
+    the chosen pool's card before the worker sees it; this fallback only
+    matters when "Use account default card" is selected and the account
+    row has no card_number on file.
+    """
+    def _card_from_account(a: dict) -> dict:
+        return {
+            "card_number": a.get("card_number") or "",
+            "card_exp_month": str(a.get("card_exp_month") or a.get("exp_month") or ""),
+            "card_exp_year": str(a.get("card_exp_year") or a.get("exp_year") or ""),
+            "card_cvv": str(a.get("card_cvv") or a.get("cvc") or ""),
+            "billing_name": a.get("billing_name") or "",
+            "billing_email": a.get("billing_email") or a.get("email") or "",
+            "billing_phone": a.get("billing_phone") or a.get("phone") or "",
+            "billing_postal": a.get("billing_postal") or "",
+            "billing_country": a.get("billing_country") or "US",
+        }
+
+    if (account.get("card_number") or "").strip():
+        return _card_from_account(account), ""
+
+    aid = account.get("id")
+    phone = account.get("phone") or "?"
+    if not aid:
+        return None, f"No card on file for {phone}; add card details to this profile."
+
+    try:
+        assigned = db.get_assigned_cards_for_account(int(aid)) or []
+    except Exception as exc:
+        log(f"Card-pool lookup failed for {phone}: {exc}", "warning")
+        assigned = []
+
+    if not assigned:
+        return None, (
+            f"No card on file for {phone}; add card details to this profile or "
+            f"assign a card to it under the Cards tab."
+        )
+
+    if len(assigned) == 1:
+        card = assigned[0]
+        last4 = (card.get("card_number") or "")[-4:] or "????"
+        label = card.get("label") or "?"
+        log(
+            f"Account {phone} has no default card — falling back to the only "
+            f"assigned card (label: '{label}', ****{last4})."
+        )
+        merged = {**account, **{k: card.get(k, "") for k in (
+            "card_number", "card_exp_month", "card_exp_year", "card_cvv",
+            "billing_name", "billing_email", "billing_phone",
+            "billing_postal", "billing_country",
+        )}}
+        return _card_from_account(merged), ""
+
+    labels = sorted({(c.get("label") or "?") for c in assigned})
+    return None, (
+        f"Account {phone} has no default card and is assigned to {len(assigned)} "
+        f"cards across labels [{', '.join(labels)}]; pick a card label in the cart "
+        f"launcher to disambiguate."
+    )
 
 
 def _clean_price_rules(raw):
@@ -1690,6 +1776,15 @@ def _run_cart_inner(
         )
         log(quantity_warning)
 
+    # Resolve which card we'll charge BEFORE holding inventory on Dice.
+    # If the user has no usable card on file, we want to fail loudly here
+    # (not after the cart is held and waiting on approval) so the failure
+    # message tells them what to fix and no Dice cart slot gets wasted.
+    card_fields, card_err = _resolve_account_card(account, log)
+    if card_fields is None:
+        log(card_err, "error")
+        return False, card_err
+
     # Stage the purchase BEFORE the approval gate so the cart is genuinely
     # held on Dice (POST /purchases) while we wait for a human. Card data
     # is intentionally NOT in scope here — prepare_purchase takes no card
@@ -1760,18 +1855,18 @@ def _run_cart_inner(
         quantity_warning=quantity_warning,
     )
 
-    # Card data only enters scope after approval has been granted. This is
-    # the single point where account card details are read.
+    # Card data only enters scope after approval has been granted. The
+    # resolver was run pre-prepare so we already know the values are non-empty.
     ok = client.finalize_purchase(
-        card_number=account.get("card_number") or "",
-        exp_month=str(account.get("card_exp_month") or account.get("exp_month") or ""),
-        exp_year=str(account.get("card_exp_year") or account.get("exp_year") or ""),
-        cvc=str(account.get("card_cvv") or account.get("cvc") or ""),
-        billing_name=account.get("billing_name") or "",
-        billing_email=account.get("billing_email") or account.get("email") or "",
-        billing_phone=account.get("billing_phone") or account.get("phone") or "",
-        billing_postal_code=account.get("billing_postal") or "",
-        billing_country=account.get("billing_country") or "US",
+        card_number=card_fields["card_number"],
+        exp_month=card_fields["card_exp_month"],
+        exp_year=card_fields["card_exp_year"],
+        cvc=card_fields["card_cvv"],
+        billing_name=card_fields["billing_name"],
+        billing_email=card_fields["billing_email"],
+        billing_phone=card_fields["billing_phone"],
+        billing_postal_code=card_fields["billing_postal"],
+        billing_country=card_fields["billing_country"],
     )
 
     if ok:
@@ -1942,6 +2037,7 @@ METHODS = {
     "db.get_card_labels": m_db_get_card_labels,
     "db.get_assigned_cards_for_account": m_db_get_assigned_cards_for_account,
     "db.bulk_account_cards_by_label": m_db_bulk_account_cards_by_label,
+    "db.get_all_assigned_cards": m_db_get_all_assigned_cards,
     "db.bulk_add_payment_cards": m_db_bulk_add_payment_cards,
     "db.get_code_pools": m_db_get_code_pools,
     "db.create_code_pool": m_db_create_code_pool,

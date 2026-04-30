@@ -1017,16 +1017,22 @@ function openBulkImportCardsModal() {
   openModal({
     title: "Bulk import cards",
     bodyHtml: `
-      <p class="muted" style="font-size:12px;margin:0 0 8px;">Paste a CSV. Each row creates one new card. The <code>label</code> column names a pool — pools that don't exist yet are created automatically. Assign cards to accounts after import.</p>
+      <p class="muted" style="font-size:12px;margin:0 0 8px;">Paste a CSV. Each row creates one new card. The <code>label</code> column names a pool — pools that don't exist yet are created automatically.</p>
       <pre style="background:var(--bg-0);padding:10px;border-radius:6px;font-size:11px;overflow:auto;margin:0 0 10px;">${escapeHtml(cardImportSampleHeader())}</pre>
       <textarea id="bi_text" rows="10" style="width:100%;font-family:monospace;font-size:12px;" placeholder="${escapeHtml(cardImportSampleHeader())}"></textarea>
-      <div id="bi_status" class="status-line muted" style="margin-top:8px;">Paste rows above to import.</div>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;">
+        <input type="checkbox" id="bi_auto_assign" checked />
+        <span>Auto-assign each card to a profile when <code>billing_phone</code> matches a profile's phone (last 10 digits) or <code>billing_email</code> matches a profile's email.</span>
+      </label>
+      <p class="muted" style="font-size:11px;margin:4px 0 0;">Cards that match more than one profile or zero profiles are still imported but left unassigned — you can wire those up by hand.</p>
+      <div id="bi_status" class="status-line muted" style="margin-top:8px;white-space:pre-wrap;">Paste rows above to import.</div>
     `,
     footerHtml: `<button class="btn btn-ghost" data-close>Cancel</button>
                  <button class="btn btn-primary" id="bi_import">Import</button>`,
     onMount: () => {
       $("#bi_import").addEventListener("click", async () => {
         const text = $("#bi_text").value;
+        const autoAssign = !!$("#bi_auto_assign")?.checked;
         const { rows, errors } = parseCardCsv(text);
         const status = $("#bi_status");
         if (errors.length) {
@@ -1041,14 +1047,27 @@ function openBulkImportCardsModal() {
         }
         status.style.color = "";
         status.textContent = `Importing ${rows.length} row${rows.length === 1 ? "" : "s"}…`;
-        const r = await api.bulkAddPaymentCards(rows);
+        const r = await api.bulkAddPaymentCards(rows, autoAssign);
         if (!r.ok) { status.style.color = "var(--danger)"; status.textContent = "Import failed: " + r.error; return; }
         const data = r.data || {};
         const parts = [`${data.added || 0} added`];
+        if (autoAssign) {
+          parts.push(`${data.assigned || 0} auto-assigned`);
+          if (data.unmatched?.length) parts.push(`${data.unmatched.length} unmatched`);
+          if (data.ambiguous?.length) parts.push(`${data.ambiguous.length} ambiguous`);
+        }
         if (data.errors?.length) parts.push(`${data.errors.length} error${data.errors.length === 1 ? "" : "s"}`);
-        status.style.color = data.errors?.length ? "var(--warn)" : "";
+        status.style.color = (data.errors?.length || data.ambiguous?.length) ? "var(--warn)" : "";
         let detail = "";
-        if (data.errors?.length) detail += `\nErrors: ${data.errors.slice(0, 5).map((e) => `row ${e.row}: ${e.error}`).join("; ")}`;
+        if (data.errors?.length) {
+          detail += `\nErrors: ${data.errors.slice(0, 5).map((e) => `row ${e.row}: ${e.error}`).join("; ")}`;
+        }
+        if (data.ambiguous?.length) {
+          detail += `\nAmbiguous (multiple profiles match): ${data.ambiguous.slice(0, 5).map((e) => `row ${e.row} (${e.match_count} matches)`).join("; ")}`;
+        }
+        if (data.unmatched?.length) {
+          detail += `\nUnmatched (no profile found): ${data.unmatched.slice(0, 5).map((e) => `row ${e.row} ${e.billing_phone || e.billing_email || ""}`.trim()).join("; ")}`;
+        }
         status.textContent = parts.join(" · ") + detail;
         await refreshPaymentCards();
       });
@@ -1915,29 +1934,84 @@ function exportInventory(format = "csv") {
   downloadFile(`inventory-${stamp}.csv`, toCsv(items, cols), "text/csv");
 }
 
-function exportAccounts() {
+async function exportAccounts() {
   const accounts = state.accounts || [];
   if (!accounts.length) { alert("No accounts to export."); return; }
+
+  // Pull every (account → assigned card) link in one round-trip so accounts
+  // with multiple labeled cards expand into multiple rows.
+  let assignedMap = {};
+  try {
+    const res = await api.getAllAssignedCards();
+    if (res.ok) assignedMap = res.data || {};
+  } catch (_) { /* fall through with empty map */ }
+
+  const rows = [];
+  for (const a of accounts) {
+    const assigned = assignedMap[a.id] || assignedMap[String(a.id)] || [];
+    const hasDefaultCard = !!(a.card_number && String(a.card_number).trim());
+
+    // Always emit a "default" row when the account has its own card_number,
+    // OR when the account has no labeled cards at all (so the account itself
+    // still appears in the export and round-trips back as an account row).
+    if (hasDefaultCard || !assigned.length) {
+      rows.push({
+        ...a,
+        card_label: "",
+        card_number: a.card_number || "",
+        card_exp_month: a.card_exp_month || "",
+        card_exp_year: a.card_exp_year || "",
+        card_cvv: a.card_cvv || "",
+      });
+    }
+
+    // One additional row per labeled card. Card-level billing wins if set,
+    // else fall back to the account's billing so the row is self-contained.
+    for (const c of assigned) {
+      rows.push({
+        ...a,
+        card_label: c.label || "",
+        card_number: c.card_number || "",
+        card_exp_month: c.card_exp_month || "",
+        card_exp_year: c.card_exp_year || "",
+        card_cvv: c.card_cvv || "",
+        billing_name: c.billing_name || a.billing_name || "",
+        billing_email: c.billing_email || a.billing_email || "",
+        billing_phone: c.billing_phone || a.billing_phone || "",
+        billing_postal: c.billing_postal || a.billing_postal || "",
+        billing_country: c.billing_country || a.billing_country || "US",
+      });
+    }
+  }
+
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  // Column names match the importer's _col aliases so the export round-trips
+  // cleanly; `card_label` is the new column that distinguishes default vs.
+  // pool cards (blank = default). Legacy CSVs without it still import fine.
   const cols = [
-    { key: "id", label: "id" },
     { key: "phone", label: "phone" },
     { key: "email", label: "email" },
+    { key: "name", label: "profile_name" },
     { key: "group_name", label: "group" },
-    { key: "proxy", label: "proxy" },
-    { key: "billing_country", label: "billing_country" },
-    { key: "session_status", label: "session_status" },
-    { key: "session_expires_in", label: "session_expires_in" },
-    { key: "session_saved_at", label: "session_saved_at_unix", get: (r) => r.session_saved_at || "" },
-    { key: "card_label", label: "card_label", get: (r) => r.card_label || "" },
-    { key: "aycd_key", label: "aycd_key" },
-    { key: "imap_email", label: "imap_email" },
+    { key: "card_label", label: "card_label" },
+    { key: "card_number", label: "card_number" },
+    { key: "card_exp_month", label: "card_exp_month" },
+    { key: "card_exp_year", label: "card_exp_year" },
+    { key: "card_cvv", label: "card_cvv" },
     { key: "billing_name", label: "billing_name" },
     { key: "billing_email", label: "billing_email" },
     { key: "billing_phone", label: "billing_phone" },
     { key: "billing_postal", label: "billing_postal" },
+    { key: "billing_country", label: "billing_country" },
+    { key: "proxy", label: "proxy" },
+    { key: "aycd_key", label: "aycd_key" },
+    { key: "imap_email", label: "imap_email" },
+    { key: "imap_password", label: "imap_password" },
+    { key: "session_status", label: "session_status" },
+    { key: "session_expires_in", label: "session_expires_in" },
+    { key: "session_saved_at", label: "session_saved_at_unix", get: (r) => r.session_saved_at || "" },
   ];
-  downloadFile(`accounts-${stamp}.csv`, toCsv(accounts, cols), "text/csv");
+  downloadFile(`accounts-${stamp}.csv`, toCsv(rows, cols), "text/csv");
 }
 
 function exportCartEvents(sessionId, format = "csv") {
