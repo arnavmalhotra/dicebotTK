@@ -123,9 +123,11 @@ class DiceFM:
             try:
                 qty = int(item.get("quantity"))
             except (TypeError, ValueError):
-                qty = 1
-            if qty <= 0:
-                qty = 1
+                qty = 0
+            # 0 = sentinel meaning "use the tier's max_per_order"; resolved
+            # in fetch_ticket_types once the chosen tier is known.
+            if qty < 0:
+                qty = 0
             rule = {"quantity": qty}
             raw_min = item.get("min_price")
             if raw_min not in (None, ""):
@@ -776,9 +778,17 @@ class DiceFM:
                 )
                 return data
             idx, rule = matched_rule
-            self.selected_quantity = rule.get("quantity", 1)
+            tier_max = int(selected["tt"].get("limits", {}).get("max_increments") or 1)
+            rule_qty = int(rule.get("quantity") or 0)
+            # 0 = "use tier max"; otherwise honour the rule but cap at tier max.
+            if rule_qty <= 0:
+                self.selected_quantity = tier_max
+                qty_label = f"max ({tier_max})"
+            else:
+                self.selected_quantity = min(rule_qty, tier_max)
+                qty_label = str(self.selected_quantity)
             self.info(
-                f"  -> Rule #{idx} matched: buy {self.selected_quantity} ({_describe_rule(rule)}) "
+                f"  -> Rule #{idx} matched: buy {qty_label} ({_describe_rule(rule)}) "
                 f"at price ${selected['price']:.2f}"
             )
 
@@ -1776,26 +1786,30 @@ class DiceFM:
             self.warn("No reserve_token — ticket may be sold out")
             return "no_tickets"
 
-    def run_purchase_flow(
-        self,
-        quantity: int = 1,
-        card_number: str = "",
-        exp_month: str = "",
-        exp_year: str = "",
-        cvc: str = "",
-        billing_name: str = "",
-        billing_email: str = "",
-        billing_phone: str = "",
-        billing_postal_code: str = "",
-        billing_country: str = "US",
-    ) -> bool:
-        """Run the purchase + Stripe payment flow. Returns True on success."""
+    # hCaptcha tokens issued by the captcha solvers stay valid for ~120s on
+    # Stripe's side. If approval drags past this threshold between
+    # prepare_purchase and finalize_purchase, finalize re-solves before
+    # confirming so the token isn't rejected for staleness.
+    _HCAPTCHA_REFRESH_AGE_SECONDS = 90.0
+
+    def prepare_purchase(self, quantity: int = 1) -> tuple[bool, str]:
+        """Stage everything up to (but NOT including) the card-confirm step.
+
+        Reserves real inventory on Dice via POST /purchases, fetches the
+        Stripe payment intent, runs the Stripe.js handshake mimicry, and
+        pre-solves hCaptcha. After this returns ok, the cart is genuinely
+        held on Dice for `purchaseTTL` seconds; finalize_purchase only needs
+        to fire the single stripe_confirm_payment call.
+
+        SAFETY: this function takes no card arguments and never calls
+        stripe_confirm_payment. Card data cannot reach Dice or Stripe from
+        this code path.
+        """
         if not self.reserveToken:
             self.error("No reserve_token — run auth flow first")
-            return False
+            return False, "No reserve_token"
 
-        self.info(f"Starting purchase: {self.ticketName} ${self.ticketPrice} x{quantity}")
-        self.info(f"Card: ****{card_number[-4:]}")
+        self.info(f"Preparing purchase: {self.ticketName} ${self.ticketPrice} x{quantity}")
 
         max_tier_attempts = 6
         resp = None
@@ -1806,7 +1820,7 @@ class DiceFM:
             self.fetch_ticket_types(authenticated=True)
             if not self.reserveToken:
                 self.error("No tier available with a reserve token")
-                return False
+                return False, "No tier available with a reserve token"
             quantity = max(1, int(self.selected_quantity or quantity))
             allowed = max(1, int(self.ticketMaxPerOrder or quantity))
             if quantity > allowed:
@@ -1826,7 +1840,7 @@ class DiceFM:
             retriable = err_key in {"ticket_type_not_enough_tickets", "ticket_type_sold_out"}
             if not retriable:
                 self.error(f"Purchase creation failed: {err_text or 'no response'}")
-                return False
+                return False, f"Purchase creation failed: {err_text or 'no response'}"
             failed_tier = self.ticketTypeId
             self.warn(
                 f"Tier '{self.ticketName}' rejected ({err_key}); excluding and trying next tier "
@@ -1838,13 +1852,15 @@ class DiceFM:
                     self.ticketTypePreferenceId = None
         else:
             self.error(f"Exhausted tier fallback after {max_tier_attempts} attempts.")
-            return False
+            return False, f"Exhausted tier fallback after {max_tier_attempts} attempts."
         time.sleep(0.5)
 
-        resp = self.get_payment_intent()
+        self.purchaseQuantity = quantity
+
+        self.get_payment_intent()
         if not self.piSecret:
             self.error("No payment intent secret returned")
-            return False
+            return False, "No payment intent secret returned"
         time.sleep(0.3)
 
         # Stripe telemetry + fingerprinting
@@ -1857,11 +1873,55 @@ class DiceFM:
         self.get_stripe_elements_session()
         self._stripe_link_get_cookie()
 
-        # Solve hCaptcha for Stripe
-        hcaptcha_token = self.solve_hcaptcha()
+        # Pre-solve hCaptcha so finalize is a single confirm POST. Stash the
+        # token + solve time so finalize can re-solve if approval drags past
+        # the captcha's expiry window.
+        self.hcaptcha_token = self.solve_hcaptcha()
+        self.hcaptcha_solved_at = time.time()
         self.send_stripe_mouse_timings()
 
-        # Confirm payment
+        return True, ""
+
+    def finalize_purchase(
+        self,
+        card_number: str,
+        exp_month: str,
+        exp_year: str,
+        cvc: str,
+        billing_name: str,
+        billing_email: str,
+        billing_phone: str,
+        billing_postal_code: str,
+        billing_country: str = "US",
+    ) -> bool:
+        """Submit card details and confirm the Stripe payment.
+
+        SAFETY: this is the ONLY function in the purchase pipeline that
+        accepts or transmits card data. It must only be called after
+        prepare_purchase returned ok AND any required approval has been
+        granted; the worker enforces the approval gate.
+        """
+        if not self.purchaseId or not self.piSecret:
+            self.error("finalize_purchase called before prepare_purchase succeeded")
+            return False
+
+        qty = getattr(self, "purchaseQuantity", 1) or 1
+        self.info(f"Finalizing purchase: {self.ticketName} x{qty}")
+        self.info(f"Card: ****{card_number[-4:]}")
+
+        hcaptcha_token = getattr(self, "hcaptcha_token", None)
+        solved_at = getattr(self, "hcaptcha_solved_at", 0.0) or 0.0
+        age = time.time() - solved_at if solved_at else float("inf")
+        if not hcaptcha_token or age > self._HCAPTCHA_REFRESH_AGE_SECONDS:
+            self.info(
+                f"hCaptcha token stale (age {age:.1f}s) — re-solving before confirm."
+            )
+            hcaptcha_token = self.solve_hcaptcha()
+            self.hcaptcha_token = hcaptcha_token
+            self.hcaptcha_solved_at = time.time()
+            # Refresh mouse-timing telemetry too so it lines up with the new solve.
+            self.send_stripe_mouse_timings()
+
         resp = self.stripe_confirm_payment(
             card_number=card_number,
             exp_month=exp_month,
@@ -1886,3 +1946,36 @@ class DiceFM:
         error_text = resp.text if resp else "no response"
         self.error(f"Payment failed: {error_text}")
         return False
+
+    def run_purchase_flow(
+        self,
+        quantity: int = 1,
+        card_number: str = "",
+        exp_month: str = "",
+        exp_year: str = "",
+        cvc: str = "",
+        billing_name: str = "",
+        billing_email: str = "",
+        billing_phone: str = "",
+        billing_postal_code: str = "",
+        billing_country: str = "US",
+    ) -> bool:
+        """Backwards-compatible wrapper: prepare + finalize back to back.
+
+        Callers that need an approval gate between the two phases should
+        invoke prepare_purchase and finalize_purchase directly.
+        """
+        ok, _ = self.prepare_purchase(quantity=quantity)
+        if not ok:
+            return False
+        return self.finalize_purchase(
+            card_number=card_number,
+            exp_month=exp_month,
+            exp_year=exp_year,
+            cvc=cvc,
+            billing_name=billing_name,
+            billing_email=billing_email,
+            billing_phone=billing_phone,
+            billing_postal_code=billing_postal_code,
+            billing_country=billing_country,
+        )

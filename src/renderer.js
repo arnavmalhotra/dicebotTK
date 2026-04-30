@@ -172,7 +172,8 @@ function sanitizePriceRules(raw) {
   for (const item of Array.isArray(raw) ? raw : []) {
     if (!item || typeof item !== "object") continue;
     const rawQty = parseInt(item.quantity, 10);
-    const quantity = Number.isFinite(rawQty) && rawQty > 0 ? rawQty : 1;
+    // 0 is a sentinel meaning "use the tier's max_per_order"
+    const quantity = Number.isFinite(rawQty) && rawQty > 0 ? rawQty : 0;
     const minPrice = Number(item.min_price);
     const maxPrice = Number(item.max_price);
     const rule = { quantity };
@@ -184,12 +185,13 @@ function sanitizePriceRules(raw) {
 }
 
 function renderPriceRuleRow(rule = { quantity: "", min_price: "", max_price: "" }) {
-  const qty = rule.quantity === "" || rule.quantity == null ? "" : String(rule.quantity);
+  // 0 = "use tier max"; render as blank so the placeholder ("max") shows.
+  const qty = rule.quantity === "" || rule.quantity == null || rule.quantity === 0 ? "" : String(rule.quantity);
   const minPrice = rule.min_price === "" || rule.min_price == null ? "" : String(rule.min_price);
   const maxPrice = rule.max_price === "" || rule.max_price == null ? "" : String(rule.max_price);
   return `
     <div class="price-rule-row" style="display:flex;gap:8px;align-items:flex-end;margin-bottom:6px;">
-      <label style="flex:1;"><span>Buy (qty)</span><input class="price-rule-qty" type="text" inputmode="numeric" pattern="[0-9]*" value="${escapeHtml(qty)}" placeholder="1"/></label>
+      <label style="flex:1;"><span>Buy (qty)</span><input class="price-rule-qty" type="text" inputmode="numeric" pattern="[0-9]*" value="${escapeHtml(qty)}" placeholder="max"/></label>
       <label style="flex:1;"><span>min $</span><input class="price-rule-min" type="text" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" value="${escapeHtml(minPrice)}" placeholder="any"/></label>
       <label style="flex:1;"><span>max $</span><input class="price-rule-max" type="text" inputmode="decimal" pattern="[0-9]*\.?[0-9]*" value="${escapeHtml(maxPrice)}" placeholder="any"/></label>
       <button type="button" class="btn btn-ghost btn-sm price-rule-remove" title="Remove rule">✕</button>
@@ -223,7 +225,8 @@ function mountPriceRuleList(listEl, addBtn, initialRules) {
     const collected = [];
     listEl.querySelectorAll(".price-rule-row").forEach((row) => {
       const rawQty = parseInt(row.querySelector(".price-rule-qty")?.value, 10);
-      const quantity = Number.isFinite(rawQty) && rawQty > 0 ? rawQty : 1;
+      // 0 means "use the tier's max_per_order" — backend resolves this once the tier is picked.
+      const quantity = Number.isFinite(rawQty) && rawQty > 0 ? rawQty : 0;
       const minPrice = parseOptionalFloat(row.querySelector(".price-rule-min")?.value);
       const maxPrice = parseOptionalFloat(row.querySelector(".price-rule-max")?.value);
       const rule = { quantity };
@@ -249,7 +252,8 @@ function summarizePriceRules(rules) {
   } else {
     cond = "(any price)";
   }
-  const first = `Buy ${r.quantity} ${cond}`;
+  const qtyLabel = r.quantity && r.quantity > 0 ? String(r.quantity) : "max";
+  const first = `Buy ${qtyLabel} ${cond}`;
   return list.length === 1 ? first : `${first} +${list.length - 1}`;
 }
 
@@ -2553,7 +2557,7 @@ async function openCartModal(options = {}) {
         <button type="button" class="btn btn-ghost btn-sm" id="c_rules_add">+ Add rule</button>
       </div>
       <div id="c_rules_list"></div>
-      <p class="muted" style="font-size:12px; margin:4px 0 0;">Each rule: reserve N tickets if the tier price is between $min and $max. All three fields are optional — qty defaults to 1, blank min/max means no bound. Evaluated in order; first matching rule wins. Leave the list empty to reserve whatever the strategy picks at any price. Cart still waits for your in-app approval before checkout.</p>
+      <p class="muted" style="font-size:12px; margin:4px 0 0;">Each rule: reserve N tickets if the tier price is between $min and $max. All three fields are optional — blank qty reserves the tier's max allowed per order, blank min/max means no bound. Evaluated in order; first matching rule wins. Leave the list empty to reserve whatever the strategy picks at any price. Cart still waits for your in-app approval before checkout.</p>
     </div>
   `;
   const tierBlock = `${tierInfoHtml}${tierInputHtml}${rulesHtml}`;
@@ -2818,7 +2822,8 @@ async function openCartModal(options = {}) {
         const fromDefaults = defaults.price_rules;
         if (Array.isArray(fromDefaults) && fromDefaults.length) return fromDefaults;
         if (defaults.target_max_price != null) {
-          const seed = { quantity: Math.max(1, parseInt(defaults.quantity, 10) || 1), max_price: Number(defaults.target_max_price) };
+          const seedQty = parseInt(defaults.quantity, 10);
+          const seed = { quantity: Number.isFinite(seedQty) && seedQty > 0 ? seedQty : 0, max_price: Number(defaults.target_max_price) };
           if (defaults.target_min_price != null) seed.min_price = Number(defaults.target_min_price);
           return [seed];
         }

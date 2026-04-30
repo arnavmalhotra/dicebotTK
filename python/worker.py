@@ -106,17 +106,12 @@ _STDOUT_LOCK = threading.Lock()
 _APPROVAL_TTL_SECONDS = 300
 
 # ── Telemetry (silent — end users never see this) ─────────────────────────
-# These values are baked into the worker so every TK install posts to the
-# same DiceBotWeb endpoint without per-user configuration. Override at
-# runtime by setting TK_TELEMETRY_URL / TK_TELEMETRY_SECRET in the env (used
-# during local dev only — the packaged build has no env override).
+# Baked into the worker so every TK install posts to the same DiceBotWeb
+# endpoint without per-user configuration. Override at runtime by setting
+# TK_TELEMETRY_URL in the env (used during local dev only).
 TK_TELEMETRY_URL = os.environ.get(
     "TK_TELEMETRY_URL",
     "https://tieroneonly.com/api/tk/telemetry",
-)
-TK_TELEMETRY_SECRET = os.environ.get(
-    "TK_TELEMETRY_SECRET",
-    "a5328ee83a3378ffb2316da716184e6bb8f62f1a2b6b89c6585c978c1f0d24bc",
 )
 
 
@@ -127,7 +122,6 @@ def _post_telemetry_async(*, payload, log, device_id=None) -> None:
     telemetry succeeding. End users have no visibility into this.
     """
     url = TK_TELEMETRY_URL
-    secret = TK_TELEMETRY_SECRET
     if not url:
         return
 
@@ -141,7 +135,6 @@ def _post_telemetry_async(*, payload, log, device_id=None) -> None:
                 json=payload,
                 headers={
                     "Content-Type": "application/json",
-                    "x-tk-telemetry-secret": str(secret or ""),
                     "User-Agent": "DiceBotTK/telemetry",
                 },
                 timeout=8,
@@ -505,9 +498,10 @@ def _clean_price_rules(raw):
         try:
             quantity = int(item.get("quantity"))
         except (TypeError, ValueError):
-            quantity = 1
-        if quantity <= 0:
-            quantity = 1
+            quantity = 0
+        # 0 = sentinel meaning "use the tier's max_per_order"; resolved later.
+        if quantity < 0:
+            quantity = 0
         rule = {"quantity": quantity}
         min_price = _optional_float(item.get("min_price"))
         if min_price is not None and min_price > 0:
@@ -766,11 +760,16 @@ def _wait_for_checkout_approval(
     approve_evt: threading.Event,
     emit_update,
     log,
+    ttl_seconds: int | None = None,
 ) -> tuple[bool, str | None]:
     config = _approval_config(params)
     remote_enabled = bool(config["webhook_url"] and config["poll_url"])
     approval_id = f"apr_{uuid.uuid4().hex[:26]}"
-    expires_at = datetime.now(UTC) + timedelta(seconds=_APPROVAL_TTL_SECONDS)
+    # If the cart was already reserved on Dice via /purchases, ttl_seconds is
+    # the smaller of Dice's purchaseTTL and our local cap so we never wait
+    # past the real expiry.
+    effective_ttl = int(ttl_seconds) if ttl_seconds and ttl_seconds > 0 else _APPROVAL_TTL_SECONDS
+    expires_at = datetime.now(UTC) + timedelta(seconds=effective_ttl)
     expires_at_iso = expires_at.isoformat().replace("+00:00", "Z")
 
     emit_update(
@@ -779,7 +778,7 @@ def _wait_for_checkout_approval(
         ticket_price=client.ticketPrice,
         ticket_currency=client.ticketCurrency,
         event_name=client.eventName,
-        ttl=_APPROVAL_TTL_SECONDS,
+        ttl=effective_ttl,
         quantity=final_quantity,
         total_price=(float(client.ticketPrice or 0) * final_quantity),
         requested_quantity=requested_quantity,
@@ -812,7 +811,7 @@ def _wait_for_checkout_approval(
                 approval_error=send_error,
             )
 
-    deadline = time.time() + _APPROVAL_TTL_SECONDS
+    deadline = time.time() + effective_ttl
     next_poll_at = 0.0
     last_poll_error = None
 
@@ -1691,12 +1690,45 @@ def _run_cart_inner(
         )
         log(quantity_warning)
 
+    # Stage the purchase BEFORE the approval gate so the cart is genuinely
+    # held on Dice (POST /purchases) while we wait for a human. Card data
+    # is intentionally NOT in scope here — prepare_purchase takes no card
+    # arguments and never calls stripe_confirm_payment. Inventory is locked
+    # for client.purchaseTTL seconds; if approval doesn't land in time, the
+    # Dice cart expires on its own without any charge.
+    emit_update(
+        status="reserving",
+        ticket_name=client.ticketName,
+        ticket_price=client.ticketPrice,
+        ticket_currency=client.ticketCurrency,
+        event_name=client.eventName,
+        quantity=final_quantity,
+        requested_quantity=requested_quantity,
+        quantity_warning=quantity_warning,
+    )
+    prep_ok, prep_err = client.prepare_purchase(quantity=final_quantity)
+    if not prep_ok:
+        return False, prep_err or "prepare_purchase failed"
+    if stop_evt.is_set():
+        return False, "stopped"
+
+    # Quantity may have been re-clamped inside prepare_purchase if the tier
+    # changed during fallback. Re-pull the authoritative value.
+    final_quantity = max(1, int(getattr(client, "purchaseQuantity", final_quantity) or final_quantity))
+
     # TK has auto-checkout disabled — every cart waits for approval, regardless
     # of what the params say. Webhook approval still works alongside in-app.
     mode = "manual"
     approval_cfg = _approval_config(params)
     approval_required = True
     if approval_required:
+        # Cap the wait at Dice's actual cart TTL; never wait past it.
+        purchase_ttl = int(getattr(client, "purchaseTTL", 0) or 0)
+        ttl_for_wait = (
+            min(purchase_ttl, _APPROVAL_TTL_SECONDS)
+            if purchase_ttl > 0
+            else _APPROVAL_TTL_SECONDS
+        )
         approved, approval_error = _wait_for_checkout_approval(
             sid=sid,
             account=account,
@@ -1709,8 +1741,11 @@ def _run_cart_inner(
             approve_evt=approve_evt,
             emit_update=emit_update,
             log=log,
+            ttl_seconds=ttl_for_wait,
         )
         if not approved:
+            # Cart stays held on Dice until purchaseTTL expires; no charge
+            # since stripe_confirm_payment is never called on this path.
             return False, approval_error or "Approval declined"
 
     emit_update(
@@ -1725,8 +1760,9 @@ def _run_cart_inner(
         quantity_warning=quantity_warning,
     )
 
-    ok = client.run_purchase_flow(
-        quantity=final_quantity,
+    # Card data only enters scope after approval has been granted. This is
+    # the single point where account card details are read.
+    ok = client.finalize_purchase(
         card_number=account.get("card_number") or "",
         exp_month=str(account.get("card_exp_month") or account.get("exp_month") or ""),
         exp_year=str(account.get("card_exp_year") or account.get("exp_year") or ""),
