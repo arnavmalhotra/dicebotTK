@@ -218,8 +218,8 @@ body {
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-ghost { background: transparent; color: var(--text); border-color: var(--border-strong); }
 .btn-ghost:hover:not(:disabled) { background: var(--bg-2); }
-.btn-danger { background: var(--danger); color: white; }
-.btn-danger:hover:not(:disabled) { filter: brightness(1.1); }
+.btn-danger { background: #ef4444; color: white; }
+.btn-danger:hover:not(:disabled) { background: #dc2626; }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
 .btn-icon {
   background: transparent;
@@ -230,6 +230,8 @@ body {
   border-radius: 6px;
 }
 .btn-icon:hover { background: var(--bg-3); color: var(--text); }
+.btn-icon[data-action="delete"] { color: #ef4444; }
+.btn-icon[data-action="delete"]:hover { background: rgba(239,68,68,0.18); color: #ef4444; }
 
 /* ── Stats row ───────────────────────────────────────────────────── */
 .stats-row {
